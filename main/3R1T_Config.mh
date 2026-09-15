@@ -1,0 +1,935 @@
+//=========================================================================
+// 3R1T_Config.mh
+//
+// EVERY tunable number for the 3R1T rig lives in this file. Nothing here
+// executes - it is #defines only, so you can read the whole machine
+// configuration on one screen and change it without touching the logic.
+//
+//   3R1T_Config.mh      <- you are here   constants
+//   3R1T_Globals.mh                       variables + small helpers
+//   3R1T_Kin_3R.mh                        3R spherical IK   (complete)
+//   3R1T_Kin_1T.mh                        1T tool  IK       (complete)
+//   QUB_3R1T_Traj.mc                      the program
+//
+// The things you are most likely to want to change are marked >>> <<<.
+//=========================================================================
+
+#ifndef _3R1T_CONFIG_MH_
+#define _3R1T_CONFIG_MH_
+
+#define C_APP_VERSION	1
+
+#define FALSE	0
+#define TRUE	1
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 1 - AXES
+//
+// Axis modules 0/1/2 are hard-wired to EPOS4 nodes 1/2/3 and module 6 to
+// node 4 by the CANopen setup. That pairing is fixed and must not be
+// changed here.
+//
+// 3/4/5/7 are SIMULATED axes. They do not exist in hardware. They are the
+// commanded end-effector pose: the program gives them a normal profiled
+// move, and the 2 ms ISR reads their position, runs the kinematics and
+// streams the result to the real drives. That is what makes the motion
+// smooth in TASK space and, crucially, what keeps the IK continuity
+// tracker fed with small steps - see the warning in 3R1T_Kin_3R.mh.
+///////////////////////////////////////////////////////////////////////////
+#define C_AXIS1				0		// real arm drive 1  (EPOS4 node 1)
+#define C_AXIS2				1		// real arm drive 2  (EPOS4 node 2)
+#define C_AXIS3				2		// real arm drive 3  (EPOS4 node 3)
+#define C_AXIS_1T			6		// real translation drive (EPOS4 node 4)
+
+#define EE_PSI				3		// virtual: psi     rotation about base X
+#define EE_PHI				4		// virtual: phi     rotation about base Y
+#define EE_THETA_N			5		// virtual: theta_n rotation about platform normal
+#define EE_TOOL				7		// virtual: tool position along the stage
+
+#define C_DRIVE_BUSID1		1
+#define C_DRIVE_BUSID2		2
+#define C_DRIVE_BUSID3		3
+#define C_DRIVE_BUSID_1T	4
+
+// >>> ARM -> MOTOR AXIS <<<
+// The ARM LABELLING on top of the fixed axis/node pairing. If a homing
+// move drives the wrong physical arm, swap two of these. Entirely
+// separate from the IMU channel map in the sensor node: motors here,
+// sensors there.
+#define C_ARM1_AXIS			C_AXIS1
+#define C_ARM2_AXIS			C_AXIS2
+#define C_ARM3_AXIS			C_AXIS3
+
+#define SIM_MODE			1
+#define REAL_AXIS			2
+#define AXES_MODE			REAL_AXIS	// SIM_MODE = motors will NOT power up
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 2 - UNITS AND DRIVE SETUP
+///////////////////////////////////////////////////////////////////////////
+#define C_CAN_BAUDRATE		88			// both CAN ports @ 1 Mbit
+#define C_PDO_NUMBER		1
+#define C_AXISPOLARITY		0
+
+// --- arm axes: user unit is the CENTIDEGREE -----------------------------
+#define C_AXIS_ENCRES		(4*1024)
+#define C_AXIS_POSENCREV	1
+#define C_AXIS_POSENCQC		C_AXIS_ENCRES
+#define C_AXIS_POSFACT_Z	(159*2)
+#define C_AXIS_POSFACT_N	1
+#define C_AXIS_FEEDREV		1
+#define C_AXIS_FEEDDIST		36000		// cdeg per output revolution
+#define C_AXIS_MAX_RPM		7000
+#define C_AXIS_VELRES		100
+#define C_AXIS_RAMPTYPE		RAMPTYPE_JERKLIMITED
+#define C_AXIS_RAMPMIN		500
+#define C_AXIS_JERKMIN		100
+#define C_AXIS_TRACKERR		200000
+
+// --- translation axis: user unit is 0.01 mm -----------------------------
+//
+// THE DRIVETRAIN
+//
+//   motor -> 159:1 gearbox -> 55 mm DRIVEN drum -> cable
+//                                    -> 28 mm idler -> reeving -> carriage
+//
+// >>> ONLY THE DRIVEN DRUM SETS THE CABLE PAYOUT. <<<
+//
+// One turn of the output shaft winds or unwinds one circumference of the
+// DRIVEN drum, and nothing downstream changes that:
+//
+//   pi x 55 = 172.79 mm of CABLE per output revolution
+//
+// The 28 mm drum is an IDLER. It spins because cable passes over it, but
+// an idler only redirects - it neither adds nor removes length, so it has
+// no place in this sum. A pulley ratio is not a length ratio: had the 55
+// driven the 28 through a belt the two would cancel exactly.
+//
+// The carriage sees less than the cable, because the carriage pulley loops
+// the cable back and two strands share the movement:
+//
+//   pi x 55 / 2 = 86.39 mm of CARRIAGE travel per output revolution
+//
+// FEEDDIST is carriage travel per output revolution, not cable, which is
+// why the reeving belongs in it and the idler does not.
+//
+// >>> THE TWO TERMS DO NOT SHARE THIS CONSTANT CLEANLY. <<<
+//
+// The tool command is a carriage displacement, so FEEDDIST converts it
+// directly. The tilt compensation is a CABLE length, and cable is not
+// carriage - it has to be divided by the strands sharing the movement
+// first. That division is C_TOOL_COMP_REEVING in 3R1T_Kin_1T.mh.
+#define C_TOOL_DRUM_DIA_MM100	5500	// 55.00 mm DRIVEN drum
+#define C_TOOL_REEVING			2		// the carriage pulley loops the cable back
+
+// pi as 31416/10000. The intermediate is about 1.7e8, inside a long.
+#define C_TOOL_TRAVEL_PER_REV_MM100	((C_TOOL_DRUM_DIA_MM100 * 31416) / 10000 / C_TOOL_REEVING)
+
+#define C_AXIS_1T_POSENCREV	1
+// Every motor and encoder on the rig is the same part, so this is the
+// arms' figure. POSENCQC also scales the following-error window, so it has
+// to be right for C_AXIS_1T_TRACKERR to mean what it says.
+#define C_AXIS_1T_POSENCQC	C_AXIS_ENCRES
+#define C_AXIS_1T_POSFACT_Z	159			// gearbox, confirmed
+#define C_AXIS_1T_POSFACT_N	1
+#define C_AXIS_1T_FEEDREV	1
+#define C_AXIS_1T_FEEDDIST	C_TOOL_TRAVEL_PER_REV_MM100	// UU per output rev
+// >>> THE MOTOR WILL DO 15000. THIS IS DELIBERATELY UNDER IT. <<<
+//
+// The drives report max 15000 rpm on all four nodes since they were
+// re-commissioned on 2026-08-26. This figure feeds C_TOOL_MAX_UU_S, which
+// is the cable rate StartPoseMove will allow, so it is the one place a
+// wrong number quietly slows every tilt on the rig - or quietly asks the
+// carriage for more than it can give. 10000 leaves a third of the motor in
+// hand against a figure nobody has yet put a tachometer on.
+#define C_AXIS_1T_MAX_RPM	10000		// motor will do 15000
+#define C_AXIS_1T_TRACKERR	200000
+
+// --- virtual end-effector axes ------------------------------------------
+// 3600 UU per rev makes Cpos read back exactly what was commanded, so the
+// psi/phi/theta_n axes read centidegrees and the tool axis reads 0.01 mm.
+#define EE_AXES_ENCRES		3600
+#define EE_AXES_POSFACT_Z	1
+#define EE_AXES_POSFACT_N	1
+#define EE_AXES_FEEDDIST	3600
+#define EE_AXES_FEEDREV		1
+
+// UU -> encoder quadcounts. REG_USERREFPOS is written in qc, not UU.
+#define FACTOR_UU_QC		((double)C_AXIS_POSENCQC*((double)C_AXIS_POSFACT_Z/C_AXIS_POSFACT_N)*((double)C_AXIS_FEEDREV/C_AXIS_FEEDDIST))
+#define FACTOR_1T_UU_QC		((double)C_AXIS_1T_POSENCQC*((double)C_AXIS_1T_POSFACT_Z/C_AXIS_1T_POSFACT_N)*((double)C_AXIS_1T_FEEDREV/C_AXIS_1T_FEEDDIST))
+
+// CANopen / internal profile objects, used by SetVelAccDec and the axis
+// user-unit setup.
+#define SYS_COS_POS_SPEED(ax)		Sysvar[0x01608100+ax*0x80000]
+#define SYS_COS_PROFIL_ACC(ax)		Sysvar[0x01608300+ax*0x80000]
+#define SYS_COS_PROFIL_DEC(ax)		Sysvar[0x01608400+ax*0x80000]
+#define SYS_COS_POS_ENC_QC(ax)		Sysvar[0x01608F01+ax*0x80000]
+#define SYS_COS_POS_ENC_REV(ax)		Sysvar[0x01608F02+ax*0x80000]
+#define SYS_COS_G1_MOTOR_REV(ax)	Sysvar[0x01609101+ax*0x80000]
+#define SYS_COS_G1_SHAFT_REV(ax)	Sysvar[0x01609102+ax*0x80000]
+#define SYS_COS_G2_FEED(ax)			Sysvar[0x01609201+ax*0x80000]
+#define SYS_COS_G2_SHAFT_REV(ax)	Sysvar[0x01609202+ax*0x80000]
+#define SYS_COS_MAX_SPEED(ax)		Sysvar[0x01607F00+ax*0x80000]
+#define SYS_INT_PROFIL_VEL(ax)		Sysvar[0x01300000+7+ax*0x100]
+#define SYS_INT_PROFIL_ACC(ax)		Sysvar[0x01300000+8+ax*0x100]
+#define SYS_INT_PROFIL_DEC(ax)		Sysvar[0x01300000+9+ax*0x100]
+
+#define C_PERIOD_TIME		2			// kinematics ISR period [ms]
+
+// How finely a planned move is sampled before it is allowed to start.
+// The cable demand is not linear in the pose, so checking only the two
+// end points can miss a bulge in the middle entirely. 32 samples costs
+// about 32 sqrt evaluations once per MOVE - nothing, next to being wrong.
+#define MOVE_PATH_SAMPLES	32
+
+// At-target window for profiled moves.
+#define C_DONE_TOL_CDEG		20			// arm / EE axes  [cdeg]  0.20 deg
+#define C_DONE_TOL_TOOL		5			// tool axis      [0.01 mm]  0.05 mm
+
+// The fastest the stage can actually be driven, in its own user units per
+// second, from the motor speed limit and the drivetrain:
+//
+//     max = MAX_RPM/60 * (POSFACT_N/POSFACT_Z) * FEEDDIST/FEEDREV
+//
+// >>> AND THE REEVING HALVES IT. <<<
+//
+// A 55 mm drum on 159:1 gives about 12600 UU/s at 7000 rpm, and that is
+// the figure this comment used to quote - but the carriage pulley loops
+// the cable back, so the carriage moves half as far as the cable pays out
+// and C_TOOL_REEVING divides it. At the 10000 rpm above the carriage tops
+// out near 9000 UU/s - 90 mm/s - and StartPoseMove clamps to three
+// quarters of that, about 68 mm/s.
+//
+// For scale: tilting costs roughly 1.4 mm of carriage per degree of phi,
+// so 15 deg/s of tilt asks for about 21 mm/s. There is room.
+#define C_TOOL_MAX_UU_S		((C_AXIS_1T_MAX_RPM / 60) * C_AXIS_1T_POSFACT_N * C_AXIS_1T_FEEDDIST / (C_AXIS_1T_POSFACT_Z * C_AXIS_1T_FEEDREV))
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 3 - COMMAND LIMITS
+//
+// >>> THE WORKSPACE FENCE <<<
+// The 3-RRR platform runs out of reachable orientations before the drives
+// run out of travel. Past the boundary the IK discriminant goes negative,
+// the solver holds the last pose and raises USR_IK_SINGULAR - so the
+// machine silently stops following the command. Refusing the move up
+// front is far easier to understand than that.
+//
+// Measured from the closed-form solution: the psi/phi corner
+// (|psi| = |phi|) becomes unreachable at 32.8 deg, near enough constant
+// for every theta_n. 30 deg leaves a small margin. Single-axis tilt goes
+// further (45 deg psi, 47 deg phi) but the box limit is what is enforced.
+///////////////////////////////////////////////////////////////////////////
+#define LIM_PSI_CDEG		3000		// +/- 30.00 deg
+#define LIM_PHI_CDEG		3000		// +/- 30.00 deg
+
+// theta_n is the infinite-roll axis: the platform can spin through as many
+// turns as the drives will take, and the IK continuity tracker unwraps it.
+// This is a drive-travel limit, not a mechanism limit.
+#define LIM_THETA_N_CDEG	72000		// +/- 720.00 deg = two full turns
+
+// >>> TOOL TRAVEL <<<
+// A plain sanity bound on the number typed into the tool box, nothing
+// more. It does NOT account for the cable the platform tilt pays out.
+//
+// There are no limit switches on the stage, so nothing downstream of this
+// will stop a large tool command. Set it to whatever you want enforced,
+// or leave it wide.
+#define LIM_TOOL_MM100		20000		// +/- 200.00 mm - effectively off
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 4 - USER_PARAM SLOT MAP
+//
+// This is the whole interface to the panel. Object 0x2201, subindex = slot
+// number. Anything the panel shows or writes is in here.
+///////////////////////////////////////////////////////////////////////////
+// --- control and status -------------------------------------------------
+#define USR_COMMAND			1	// C_CMD_*, written by the panel buttons
+#define USR_STATE			2	// C_STA_* bit field
+#define USR_LED				3	// bit0 green, bit1 amber, bit2 red
+#define USR_MSG				4	// last message code, MSG_*. The words go to
+								// the terminal - see Say() in Globals.
+
+// --- the four commanded values ------------------------------------------
+#define USR_TGT_PSI			10	// [cdeg]
+#define USR_TGT_PHI			11	// [cdeg]
+#define USR_TGT_THETA_N		12	// [cdeg]
+#define USR_TGT_TOOL		13	// [0.01 mm]
+
+// --- sensors, straight off CAN2 -----------------------------------------
+#define USR_THETA1			20	// arm 1 joint angle, IMU  [cdeg]
+#define USR_THETA2			21	// arm 2
+#define USR_THETA3			22	// arm 3
+#define USR_IMU_STATUS		23	// bit0/1/2 arm IMU ok, bit3 cal, bit4 converged
+#define USR_THETA_STALE		24	// 1 = no limb frame for > CAN_STALE_MS
+#define USR_PLAT_X			25	// 4th IMU, platform Euler X [cdeg]
+#define USR_PLAT_Y			26	// Y
+#define USR_PLAT_Z			27	// Z (yaw) - RELATIVE, it drifts
+#define USR_PLAT_STATUS		28	// bit0 ok, bit1 mag, bit2 yaw datum, bit3 converged
+#define USR_PLAT_STALE		29
+#define USR_ENC_UM			30	// encoder position from the HOMED datum [um]
+#define USR_ENC_RAW_UM		31	// encoder position from the ESP32 datum  [um]
+#define USR_ENC_VEL			32	// [0.1 mm/s, signed]
+#define USR_ENC_STATUS		33	// bit0 REF level, bit1 seen, bit2 moving, bit3 dir
+#define USR_ENC_STALE		34
+#define USR_REF_RISE_UM		35	// last REF rising edge  [um]
+#define USR_REF_FALL_UM		36	// last REF falling edge [um]
+#define USR_ENC_ZERO_UM		37	// datum captured by homing [um]
+
+// --- homing -------------------------------------------------------------
+#define USR_HOME_STATE		40	// H_*
+#define USR_HOME_PASS		41	// 3R measure->move pass number
+#define USR_MEAS1			42	// last measured arm angle [cdeg]
+#define USR_MEAS2			43
+#define USR_MEAS3			44
+#define USR_ERR1			45	// remaining error to the home angle [cdeg]
+#define USR_ERR2			46
+#define USR_ERR3			47
+#define USR_HOME_EDGE_UM	48	// the REF edge the stage homed on [um]
+
+// --- kinematics ---------------------------------------------------------
+#define USR_AX1_CDEG		50	// commanded arm 1 setpoint [cdeg]
+#define USR_AX2_CDEG		51
+#define USR_AX3_CDEG		52
+#define USR_AXT_UU			53	// commanded tool setpoint [0.01 mm]
+#define USR_IK_SINGULAR		54	// 1 = last cycle had no real solution
+#define USR_IK_SINGULAR_COUNT	55
+#define USR_IK_LINK_SURPASS	56	// 1 = two legs differ by more than a full turn
+#define USR_IK_RESET_CONT	57	// write 1 to re-seed the continuity tracker
+#define USR_ISR_DURATION	58	// kinematics ISR cost [hw ticks]
+
+// --- tuning -------------------------------------------------------------
+// >>> THE TOOL AXIS NEEDS ITS OWN SPEED. DO NOT SHARE USR_MOVE_VEL. <<<
+//
+// USR_MOVE_VEL is in centidegrees per second, which is the right unit for
+// the three angle axes. The tool axis is in 0.01 mm, so the SAME NUMBER
+// means something completely different there: 1000 reads as 10 deg/s on
+// an arm and 10 mm/s on the stage.
+//
+// 10 mm/s is not a gentle request. Through the configured 159:1 gearing
+// it is about 1590 motor revolutions a second - roughly 95000 rpm, when
+// the motor tops out at 7000. The drive cannot follow, the following
+// error trips, and every drive on the rig cuts out.
+//
+// C_TOOL_MAX_UU_S below is what the stage can ACTUALLY do, worked out
+// from the motor limit and the gearing. StartPoseMove clamps to it.
+#define USR_MOVE_VEL		60	// pose move speed [cdeg/s]  ANGLE AXES ONLY
+#define USR_MOVE_ACC		61	// pose move accel [cdeg/s^2]
+#define USR_HOME_VEL		62	// limb homing move speed [cdeg/s]
+// >>> ONE LIMIT, ALL FOUR DRIVES - WHICH IS ONLY RIGHT WHILE THEY MATCH.
+//
+// This replaced two figures, 1000 mA on the arms and 500 on the stage, on
+// the understanding that all four were the same motor through different
+// gearing. That was NOT true at the time, and the rig said so the moment
+// it was asked:
+//
+//     node 1  arm 1   nominal 1490 mA   max  9250 rpm   <- the odd one
+//     node 2  arm 2   nominal 2660 mA   max  5000 rpm
+//     node 3  arm 3   nominal 2660 mA   max  5000 rpm
+//     node 4  stage   nominal 2660 mA   max  5000 rpm
+//
+// Node 1 was commissioned for a different motor from the other three, so
+// it made roughly half the torque per amp, and at a shared limit the
+// weakest drive sets the ceiling for the whole rig. That is why an
+// intermittent "error 40" always picked arm 1 and why +phi could not get
+// past about 19 degrees.
+//
+// >>> FIXED IN EPOS STUDIO 2026-08-26. All four now read 2660 mA nominal
+//     and 15000 rpm, and the ceiling moved past 20 degrees. <<<
+//
+// CheckDriveMatch re-reads and compares them at every startup, so this
+// cannot drift back without saying so. The single figure is correct while
+// that check stays quiet; if it ever complains again, this wants splitting
+// back into a per-drive limit and slot 64 is still free for it.
+#define USR_CURRENT_LIMIT	63	// ALL FOUR drives [mA]
+#define USR_TOOL_VEL		65	// tool move speed [0.01 mm/s]
+#define USR_TOOL_ACC		66	// tool move accel [0.01 mm/s^2]
+
+// --- trajectory ---------------------------------------------------------
+#define USR_TRAJ_STATE		80	// TRJ_*
+#define USR_TRAJ_STEP		81	// step being run right now
+#define USR_TRAJ_LEN		82	// numbered rows in the loaded file
+#define USR_TRAJ_NUM		83	// the file's sequence number
+#define USR_TRAJ_LAPS		84	// laps completed in CONTINUOUS
+#define USR_TRAJ_PAUSE		85	// pause flag of the step being run
+
+// --- housekeeping -------------------------------------------------------
+#define USR_CAN_BAUD		70
+#define USR_CAN_RESET		71	// write 1 to re-arm the CAN receivers
+#define USR_ERROR_NO		72
+#define USR_ERROR_INFO		73
+
+// --- the fault snapshot -------------------------------------------------
+// >>> LATCHED AT THE MOMENT OF THE FAULT AND NOT TOUCHED AGAIN. <<<
+//
+// USR_ERROR_NO above is live - it follows ErrorNo() and is overwritten by
+// whatever happens next. These are not. They are written once, by
+// CaptureFault() from inside SIG_ERROR, and they survive until the next
+// fault, so an intermittent can be read off over SDO long after the event
+// and after the terminal has scrolled.
+//
+// The one that answers "why did it cut out" is USR_FAULT_EPOS.
+#define USR_FAULT_COUNT		90	// faults since power-up. >1 is the whole story
+#define USR_FAULT_AXIS		91	// ErrorAxis() at the fault
+#define USR_FAULT_NODE		92	// CAN node of the first drive reporting a fault
+#define USR_FAULT_EPOS		93	// >>> that drive's 0x603F. THE ACTUAL CAUSE <<<
+#define USR_FAULT_SW		94	// its statusword 0x6041
+#define USR_FAULT_STATE		95	// ST_*, what the rig was doing
+#define USR_FAULT_STEP		96	// trajectory step, 0 if not running one
+#define USR_FAULT_MS		97	// Time() at the fault [ms since power-up]
+
+// Where the rig was, in words, when it faulted. Set on entry to each
+// state; latched into USR_FAULT_STATE by CaptureFault().
+#define ST_UNKNOWN			0
+#define ST_STARTUP			1
+#define ST_FAULT			2
+#define ST_NOTHOMED			3
+#define ST_HOMING			4
+#define ST_READY			5
+#define ST_MOVING			6
+#define ST_TRAJ				7
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 4b - FAULT DIAGNOSIS
+//
+// >>> ERROR 40 IS F_AMP AND IT MEANS NOTHING ON ITS OWN. <<<
+//
+// It says a drive raised its own fault and the controller noticed. The
+// same 40 covers a following error, an overcurrent, a lost CAN frame and
+// a mains dip. The reason lives in the drive, in object 0x603F, and
+// 3R1T_Faults.mh is what goes and gets it.
+///////////////////////////////////////////////////////////////////////////
+
+// How many entries of each drive's error history (0x1003) to print. Newest
+// first, and the OLDEST of them is usually the root cause - what follows
+// is the cascade. Five is enough to see a cascade and few enough that the
+// dump does not scroll the useful line away. Each one is a CAN read.
+#define C_FAULT_HISTORY_DEPTH	5
+
+// >>> POLL THE DRIVES FOR WARNINGS WHILE THEY ARE STILL RUNNING. <<<
+//
+// A drive that is about to fault usually sets statusword bit 7 (warning)
+// or bit 11 (internal limit reached) first, sometimes seconds first.
+// Neither stops anything, so without this nothing would ever mention them
+// and the first sign of trouble is the rig cutting out.
+//
+// Costs four SDO reads a second. Set to 0 if the CAN bus itself is the
+// suspect - adding traffic to a bus you think is marginal changes the
+// thing you are trying to measure.
+#define C_DRIVE_HEALTH_POLL		1
+
+// >>> WHAT A DRIVE DOES WHEN THE CONTROLLER STOPS TALKING TO IT. <<<
+//
+// Object 0x6007, "abort connection option code", CiA 402:
+//
+//     0   no action        the drive stays as it is
+//     1   fault signal     the drive goes to FAULT
+//     2   disable voltage  the output stage is switched off
+//     3   quick stop       it decelerates on the quick-stop ramp
+//
+// This exists because of what happens on a program RELOAD. The IDE stops
+// the program without giving it a chance to shut anything down, the
+// controller's CAN goes quiet with all four drives still enabled, and they
+// come up faulted next boot. The first execute after a reload therefore
+// fails and the second works, because CheckOneDrive clears them.
+//
+// >>> IT IS NOT CERTAIN THIS CURES IT. <<<
+//
+// What was actually seen on this rig was 0x8120, CAN PASSIVE MODE - a bus
+// error-counter condition, not a detected connection abort. 0x6007 governs
+// the REACTION to an abort the drive has recognised, so it may well not be
+// the thing raising 0x8120 at all. The value each drive currently holds is
+// printed at startup and in the fault report, so try one boot and read it
+// rather than assuming.
+//
+// >>> AND CHOOSING 0 IS A SAFETY DECISION, NOT A TIDINESS ONE. <<<
+//
+// "No action" means a drive whose controller has died stays energised
+// holding its last setpoint instead of dropping out. In cyclic position
+// mode it will not run away - it holds the last target - but it also will
+// not let go. On a rig that puts a tool into something, decide that
+// deliberately.
+//
+//   -1  leave whatever the drive already has          <- the default
+//   0..3 write that value to all four at startup
+//
+// Written every boot rather than saved into the drives, so the setting
+// lives here where it can be read, and not in an EEPROM nobody remembers.
+#define C_ABORT_CONN_OPTION		(-1)
+
+
+// >>> A PAUSE BEFORE THE 2 ms INTERRUPT IS ARMED. <<<
+//
+// main() arms PeriodRoutine before SmRun has run a single state, so the
+// interrupt starts firing while the CANopen slaves are still coming up.
+// g_isr_ready already guards the axis access, but it does not slow the
+// interrupt itself down, and the drives are being configured over the same
+// bus the interrupt will stream on.
+//
+// This is a HYPOTHESIS, suggested for a fault that appears around start-up
+// and not yet proved on this rig. It costs one second of boot. If the
+// fault turns out to happen mid-run rather than at start-up, this is not
+// what fixed it, and it should be set back to 0 rather than left in place
+// as a lucky charm.
+#define C_STARTUP_SETTLE_MS		1000
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 5 - COMMANDS AND STATUS BITS
+///////////////////////////////////////////////////////////////////////////
+#define C_CMD_MOVE			0x01
+#define C_CMD_STOP			0x02
+#define C_CMD_HOME			0x08
+#define C_CMD_TRAJ_SINGLE	0x10	// run the loaded trajectory once
+#define C_CMD_TRAJ_CONT		0x20	// run it endlessly until STOP
+#define C_CMD_ERROR_CLR		0x100
+
+#define C_STA_READY			0x01	// homed, streaming, will accept MOVE
+#define C_STA_MOVING		0x02
+#define C_STA_HOMED			0x04
+#define C_STA_HOMING		0x08
+#define C_STA_ERROR			0x10
+#define C_STA_STREAM		0x20	// drives are following the kinematics
+#define C_STA_TOGGLE		0x40	// 1 Hz life beat
+#define C_STA_TRAJ			0x80	// a trajectory is running
+
+// USR_LED - exactly one of these is set at a time.
+#define LED_GREEN			0x01	// good, homed, ready to move
+#define LED_AMBER			0x02	// working, or not ready yet
+#define LED_RED				0x04	// error
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 6 - HOMING
+///////////////////////////////////////////////////////////////////////////
+// --- 3R limbs: drive each arm until its IMU reads the home angle --------
+#define HOME_ARM1_CDEG		0		// arm 1 home angle [cdeg]
+#define HOME_ARM2_CDEG		24000	// arm 2 -> 240.00 deg
+#define HOME_ARM3_CDEG		12000	// arm 3 -> 120.00 deg
+
+// >>> Sign of the motor move for a given IMU error. <<<
+// Bench-verified 2026-07-16. Flip one of these if that arm homes the
+// wrong way - it will run away from the target instead of towards it,
+// and the pass counter will hit HOME_MAX_PASSES.
+#define HOME_DIR_ARM1		-1
+#define HOME_DIR_ARM2		-1
+#define HOME_DIR_ARM3		-1
+
+#define HOME_TOL_CDEG		100		// "close enough" window: 1.00 deg
+#define HOME_AVG_SAMPLES	16		// CAN frames averaged per measurement
+#define HOME_MOVE_TIMEOUT	15000	// [ms] per limb move
+#define HOME_MAX_PASSES		8		// measure->move cycles before giving up
+#define HOME_ACC_UNITS		20
+
+// >>> THE RUNAWAY GUARDS. READ THIS BEFORE CHANGING ANY OF IT. <<<
+//
+// Homing is a feedback loop: measure the IMU error, move the motor by it,
+// measure again. It only converges if moving the motor by HOME_DIR_ARMn * d
+// actually changes the IMU reading by about +d. Call that loop gain g. The
+// error after a pass is d * (1 - g), so the loop converges only for
+// 0 < g < 2 - and DIVERGES, doubling or worse every pass, if HOME_DIR has
+// the wrong sign.
+//
+// The cycles run automatically, so nobody is watching each one go by.
+// Two guards, and they are not optional:
+//
+//   HOME_MAX_STEP_CDEG   no single pass may command more than this, so one
+//                        bad measurement is bounded damage rather than a
+//                        limb through its own workspace.
+//
+//   the shrink test      the largest remaining error must be SMALLER after
+//                        each pass than before it. If it is not, homing
+//                        stops on the spot. This is what catches a wrong
+//                        HOME_DIR sign on pass two, at twice the initial
+//                        error, instead of on pass eight at 256 times it.
+//
+// Raising HOME_MAX_STEP_CDEG or removing the shrink test re-arms the
+// runaway. If homing is too slow, lower HOME_VEL, do not widen these.
+#define HOME_MAX_STEP_CDEG	3000	// 30.00 deg of motor travel per pass
+
+// >>> AND A BUDGET FOR THE WHOLE RUN. <<<
+//
+// The per-pass clamp bounds one mistake; it does not bound eight of them.
+// HOME_MAX_PASSES passes at HOME_MAX_STEP_CDEG each is 240 deg of travel
+// that every individual guard would wave through, because an error that
+// shrinks by 30 deg a pass passes the shrink test every time.
+//
+// This is the backstop that makes "it ran away" impossible rather than
+// merely unlikely: the TOTAL an arm may travel in one homing run. An arm
+// that needs more than this to reach its home angle was not where anyone
+// thought it was, and should stop and say so.
+#define HOME_MAX_TOTAL_CDEG	9000	// 90.00 deg total per arm, per HOME
+
+// --- 1T stage: drive until the REF mark appears -------------------------
+// Set to 0 to home the arms only and leave the stage where it stands.
+// Useful while the stage is off the rig or the tool kinematics is still
+// being worked out - everything else still runs.
+#define HOME_1T_ENABLE		1
+
+// >>> Which way the stage searches FIRST. <<<
+// It reverses at the end stop, so this only decides which side is tried
+// first - never whether homing succeeds.
+#define C_1T_HOME_DIR		(-1)	// +1 or -1
+
+// >>> Which way is tool-positive. <<<
+// +1 means increasing tool command drives the stage the same way
+// C_1T_HOME_DIR searches.
+#define C_1T_POS_DIR		1		// +1 or -1
+
+// Homing runs slow on purpose: a slower crossing means a longer REF pulse
+// and less detection lag in the latched edge positions. About 2.5 mm/s at
+// the drum, far above the 0.1 mm/s stall threshold below, so the end-stop
+// detector keeps its margin.
+#define H_SEARCH_VEL		4
+#define H_TIMEOUT_MS		120000
+
+// End-stop detection. There are no limit switches, so a STALL is the end
+// stop: motor commanded to move, encoder not following. These MUST stay
+// below H_SEARCH_VEL or a genuine slow move reads as a stall.
+#define H_STALL_VEL_MMS		1		// [0.1 mm/s]
+#define H_STALL_TIME_MS		600
+#define H_STALL_ARM_MS		1000
+
+// Backing off an end stop. Straight after reversing the stage is still
+// loaded against the stop and the encoder does not move at once, so the
+// stall detector is held off until it has genuinely travelled this far.
+#define H_BACKOFF_UM		500
+#define H_BACKOFF_MAX_MS	15000
+
+// Ramp used by the stage search moves.
+#define H_ACC				10
+#define H_DEC				10
+
+// USR_HOME_STATE values.
+#define H_IDLE				0
+#define H_3R_MEASURE		1
+#define H_3R_MOVE			2
+#define H_1T_SEARCH			3
+#define H_1T_BACKOFF		4
+#define H_FINISH			5
+#define H_DONE				6
+#define H_FAILED			7
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 7 - CAN2 SENSOR FRAMES
+//
+// Produced by ../sensor_node/sensor_node_esp32. The frame is ARM-ORDERED:
+// theta1 IS arm 1. The mux channel shuffle happens on the ESP32, so there
+// is no crossover here.
+///////////////////////////////////////////////////////////////////////////
+#define CAN_BUS_OFFSET		100000	// CAN2
+#define CAN_ID_THETA		0x6E4	// limb joint angles
+#define CAN_ID_PLAT			0x6E8	// platform Euler, 4th IMU
+#define CAN_ID_TRANS		0x6E9	// stage position / velocity
+#define CAN_ID_REF			0x6EA	// stage REF mark edges
+#define CAN_STALE_MS		100
+
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 7b - TRAJECTORIES
+//
+// A trajectory is a list of poses downloaded into MoveSequenceData by the
+// panel's LOAD button. Each row is
+//
+//     STEP, PSI, PHI, THETA_N, TOOL, PAUSE, res, res, res
+//
+// with the angles in centidegrees and the tool in 0.01 mm - the same units
+// as the four command boxes. STEP is the 1-based row number and a STEP of
+// ZERO terminates the list, which is why the generator always writes a
+// terminator row.
+//
+// The array is [500][9]: 499 numbered rows fit alongside the terminator.
+//
+//
+// >>> EVERY ROW CARRIES ITS OWN PAUSE FLAG. <<<
+//
+// PAUSE is 1 to hold after that move and 0 to flow on into the next one.
+// The player reads the column and does as it is told. It does not compare
+// one row against the next, it does not work out what kind of motion each
+// leg is, and it decides nothing: a pause happens where, and only where,
+// the file says it happens.
+//
+//
+// >>> ROTATION AND TRANSLATION ARE NEVER ALLOWED TO OVERLAP. <<<
+//
+// A trajectory normally flows THROUGH its waypoints: the next target is
+// issued the moment the profile generator starts slowing towards the
+// current one, so the axes never reach zero speed and the corner comes out
+// rounded. That is right for a corner. It is WRONG where a rotation leg
+// meets a translation leg, because the rounding is the two legs
+// overlapping - the tool starts moving out while the platform is still
+// turning underneath it.
+//
+// That rule has not changed. What has changed is WHERE IT IS ENFORCED.
+// The player used to derive it at run time from the rows; now the
+// generator writes it into the file. make_trajectory.py sets PAUSE = 1 on
+// every rotation/translation boundary it emits - ORed with whatever the
+// shape itself asked for, so an authored pause is never overridden - and a
+// final assert refuses to write a file in which such a boundary carries a
+// zero. Nothing can forget, because nothing downstream is being trusted to
+// remember.
+//
+// A file that commands rotation and translation in the SAME row cannot be
+// separated by any flag at all: the two are mixed at the source. The
+// generator refuses to write one of those too.
+//
+//
+// >>> AND SO AN OLD .zbc MUST NOT BE RUN. <<<
+//
+// That is what moving the enforcement costs, and it is worth stating
+// plainly. A file written before the PAUSE column existed has a reserve
+// zero sitting where the flag now lives, and a zero reads as "flow on".
+// Such a file would run every rotation/translation boundary BLENDED - no
+// separation anywhere, which is the exact thing the rule exists to
+// prevent - and it would do it silently, because a zero is a legal value
+// and there is nothing about it to complain about. Regenerate every file
+// against this header. Do not load one off the shelf and assume the
+// player will look after it, because it no longer does.
+///////////////////////////////////////////////////////////////////////////
+#define C_SEQUENCE_SIZE		100		// rows in MoveSequenceData
+
+#define TRAJ_STEP			0		// column: 1-based row number, 0 = end
+#define TRAJ_PSI			1		// [cdeg]
+#define TRAJ_PHI			2		// [cdeg]
+#define TRAJ_THETA_N		3		// [cdeg]
+#define TRAJ_TOOL			4		// [0.01 mm]
+#define TRAJ_PAUSE			5		// 1 = hold after this move, 0 = flow on
+
+// GeneralData columns the download fills in. The file also carries its
+// name at 7..10 as packed characters, which nothing here reads.
+#define GD_SEQ_LENGTH		5		// number of numbered rows
+#define GD_SEQ_NUMBER		6		// the sequence number from the file
+
+// >>> THE FILE CARRIES ITS OWN SPEED. <<<
+//
+// A trajectory that puts a tool into something wants a different profile
+// from a trajectory that sweeps the workspace, and the speed belongs with
+// the path rather than in a box somebody has to remember to set first. The
+// four below are applied when the run starts and put back when it ends, so
+// a MOVE from the panel afterwards is unaffected.
+//
+// ZERO MEANS "LEAVE THE PANEL VALUES ALONE", and each pair is independent
+// of the other - a file may set the rotation profile and say nothing about
+// the translation one. Every file written before these slots were used
+// carries zeros, so nothing about it changed.
+//
+// >>> ROTATION AND TRANSLATION MUST NOT SHARE A NUMBER. <<<
+// See the note beside USR_MOVE_VEL. 1000 is 10 deg/s on an arm and
+// 10 mm/s on the stage, and the stage cannot do 10 mm/s.
+#define GD_ROT_VEL			11		// [cdeg/s]
+#define GD_ROT_ACC			12		// [cdeg/s^2]
+#define GD_TOOL_VEL			13		// [0.01 mm/s]
+#define GD_TOOL_ACC			14		// [0.01 mm/s^2]
+
+// The most a FILE may ask for. A .zbc is a thing that gets hand-edited and
+// copied about, so what it can ask for is fenced the same way its
+// waypoints are.
+//
+// >>> THE NUMBER IS THE POSE AXES' OWN CEILING, NOT A ROUND FIGURE. <<<
+//
+// DoSettingsUserUnits sets SYS_COS_MAX_SPEED - CANopen 0x607F, max profile
+// velocity - to 1000 on all four EE axes, and on those axes one user unit
+// is one centidegree or 0.01 mm. So the profile generator will not be
+// asked for more than 10 deg/s of pose or 10 mm/s of stage whatever is
+// written into 0x6081 by SetVelAccDec. Fencing a file above that would
+// advertise headroom the axis setup does not give it: the run would
+// quietly execute at 1000 while the header, the terminal and the
+// generator's summary all claimed something faster, and two runs at
+// "different" speeds would be the same run twice.
+//
+// >>> SO THIS FENCE AND SYS_COS_MAX_SPEED MOVE TOGETHER OR NOT AT ALL. <<<
+//
+// Raised to 1500 and then 2000 on 2026-08-27 together with
+// SYS_COS_MAX_SPEED on the three pose axes, so that 20 deg/s can be
+// asked for. 14 is the fastest that has actually been run. The two numbers are
+// one thing in two places: this fence is what a FILE may request and
+// SYS_COS_MAX_SPEED is what the axis will actually do, and a file fenced
+// above the axis would run slower than its own header claimed.
+//
+// >>> THE TOOL AXIS DID NOT MOVE WITH THEM. <<< It stays at 1000, since
+// nothing wants a faster needle and the carriage is the part with the
+// least margin. See DoSettingsUserUnits.
+//
+// The accelerations have no such axis ceiling, so they keep the four-times
+// figure - a sharper ramp at the same top speed is a real and reachable
+// difference.
+//
+// A speed outside this is CLAMPED and reported, not refused. A clamped
+// waypoint would be a different trajectory and is refused for exactly that
+// reason; a clamped speed is the same trajectory run slower, which is
+// already what StartPoseMove does to itself whenever the cable would
+// outrun the stage. Neither clamp lets the rig go faster than
+// C_TOOL_MAX_UU_S: StartPoseMove applies that afterwards regardless.
+#define C_TRAJ_VEL_ROT_MAX	2000	// [cdeg/s]      20.00 deg/s
+#define C_TRAJ_ACC_ROT_MAX	32000	// [cdeg/s^2]
+#define C_TRAJ_VEL_TOOL_MAX	1000	// [0.01 mm/s]   10.00 mm/s
+#define C_TRAJ_ACC_TOOL_MAX	28000	// [0.01 mm/s^2]
+
+// >>> A PAUSE IS TWO STAGES, AND THESE TWO NUMBERS ARE ONE APIECE. <<<
+//
+// The names are one word apart and they mean opposite things, so read this
+// before touching either. C_TRAJ_SETTLE_MS is a GIVE-UP TIMEOUT on stage
+// one and should never fire. C_TRAJ_PAUSE_MS is a COMMANDED DWELL and is
+// meant to fire on every pause there has ever been. Transposing them gives
+// a run that either bolts through its pauses or hangs eight seconds at
+// each of them.
+//
+//
+// Stage one. How long a pausing waypoint is given to come to rest before
+// the hold starts anyway, with a line in the terminal.
+//
+// The hold below must not begin until the axes have actually stopped, or
+// it would be mostly move and hardly any hold, so the run waits on
+// PoseStopped first and THIS is the bound on that wait. Every other
+// wait-on-an-axis in this program is bounded and says so when it gives up
+// - see WaitPoseStopped and the stall detector. A pause is the one place
+// where the run has no deceleration edge left to fall back on, so it needs
+// the same treatment: if standstill is never reported the run must carry
+// on and complain, not sit there indefinitely with the drives live.
+//
+// >>> IT MUST EXCEED THE LONGEST SINGLE WAYPOINT ANY FILE WILL ASK FOR. <<<
+//
+// Measured across the shipped files, at their own speeds and with the
+// ramps included:
+//
+//     full_sweep          0.32 s
+//     remove_lens         0.30 s
+//     needle_insertion    0.65 s
+//     circular_incision   5.88 s   <- its flat roll steps are 28 deg each
+//
+// 8 seconds clears the worst of those with room to spare. It is not a
+// setting to tune down: below the longest waypoint the run would give up
+// on a move that was going perfectly well, which is worse than waiting.
+// The hold is NOT in that budget - its timer is stamped when the axes are
+// found stopped, not when the row was loaded - so this figure does not
+// have to move when C_TRAJ_PAUSE_MS does.
+//
+// >>> AND IT SHOULD NEVER FIRE. <<<
+//
+// The gate is PoseStopped, which is satisfied the moment the profile
+// generators finish - not PoseAtTarget, which also asks whether they
+// finished inside the tolerance window and could be defeated for the whole
+// timeout by a fraction of a degree of residual on a passenger axis. That
+// was what turned every stop after the first into a multi-second wait.
+// With the right gate, reaching this timeout means an axis genuinely never
+// stopped, and the run prints all four profile-generator states so the log
+// names it before it starts the hold regardless.
+#define C_TRAJ_SETTLE_MS	8000	// [ms] bound on the wait for standstill
+
+// Stage two. How long a pause holds once the axes have genuinely stopped.
+//
+// >>> THE HOLD IS A FIXED TIME AND IT IS NOT WAITING FOR ANYTHING. <<<
+//
+// The axes are already at rest before this timer starts. What the second
+// buys is everything the encoders cannot see settling out - the cable, the
+// platform on its springs, whatever the tool is sitting in - and a
+// stationary window for a camera or a log to take a measurement in. Five
+// seconds is what the friction-grid capture asks for: long enough that the
+// holding current has plainly settled and can be averaged over a window
+// rather than sampled, and it is the reading either side of the dither
+// that the whole grid exists to difference.
+//
+// >>> IT IS PAID 36 TIMES IN friction_grid ALONE. <<< Three minutes of the
+// run is this number. Drop it back to 1000 if a quick shape check is all
+// that is wanted - nothing about the paths changes, only the dwell.
+//
+// >>> AND IT IS WHY THE FILE DECLARES ITS PAUSES RATHER THAN THE PLAYER
+//     INFERRING THEM. <<<
+//
+// The player used to work them out from the rows, and that was wrong three
+// ways. It could not be SEEN: nothing in the file said where the run would
+// stop, so the file and its behaviour had to be reasoned about separately
+// and the terminal was the only place the answer appeared. It could not be
+// ASKED FOR: a file that wanted to hold still in the middle of a leg for a
+// measurement had no way to say so, because the only pauses that could
+// exist were the ones the rows happened to imply. And it MIS-TIMED itself:
+// the stop lasted however long the arrival test took to be satisfied,
+// which is not a duration anybody chose and not the same duration twice.
+// A column in the file and a number here answer all three.
+#define C_TRAJ_PAUSE_MS		5000	// [ms] hold at a row with PAUSE = 1
+
+// USR_TRAJ_STATE values.
+#define TRJ_IDLE			0
+#define TRJ_SINGLE			1
+#define TRJ_CONTINUOUS		2
+
+///////////////////////////////////////////////////////////////////////////
+// SECTION 8 - STATUS MESSAGES
+//
+// The program writes one of these codes to USR_MSG and the panel looks up
+// the text in TableOfMessages.
+//
+// >>> THESE NUMBERS AND THAT TABLE ARE ONE THING IN TWO FILES. <<<
+// Add a message here and you must add it there, with the same number.
+// An unknown code shows as blank rather than as the wrong message, so a
+// missing entry is quiet - but a table that has drifted out of step puts
+// a lie on the screen, which is worse than saying nothing.
+//
+// The exact string is repeated in the comment, so this file alone tells
+// you what the panel will say. No string may contain a comma: the panel
+// file separates list items with commas and cannot tell the difference.
+///////////////////////////////////////////////////////////////////////////
+#define MSG_NONE			0	// ""
+// --- startup ------------------------------------------------------------
+#define MSG_BOOT			1	// "Starting up"
+#define MSG_CFG_DRIVES		2	// "Configuring drives"
+#define MSG_PWR_ON			3	// "Powering up all four drives"
+#define MSG_DRV_OK			4	// "All drives enabled"
+#define MSG_DRV_FAIL		5	// "DRIVE NOT ENABLED - check supply/wiring"
+#define MSG_SIM				6	// "SIM MODE - motors will not power up"
+#define MSG_NEED_HOME		7	// "Not homed - press HOME"
+// --- homing -------------------------------------------------------------
+#define MSG_HOME_START		10	// "HOMING: started"
+#define MSG_HOME_NO_IMU		11	// "HOMING refused: no limb angles on CAN"
+#define MSG_HOME_NO_ENC		12	// "HOMING refused: no encoder data on CAN"
+#define MSG_HOME_MEAS		13	// "HOMING: measuring limb angles"
+#define MSG_HOME_MOVE		14	// "HOMING: moving limbs to 0 / 240 / 120"
+#define MSG_HOME_PASS		15	// "HOMING: pass done - measuring again"
+#define MSG_HOME_LIMBS_OK	16	// "HOMING: limbs are at the home angles"
+#define MSG_HOME_NO_CONV	17	// "HOMING failed: limbs not converging"
+#define MSG_HOME_MV_TMO		18	// "HOMING failed: limbs did not settle"
+#define MSG_HOME_STALE		19	// "HOMING failed: sensor CAN went stale"
+#define MSG_HOME_1T_START	20	// "HOMING: searching for the stage REF mark"
+#define MSG_HOME_1T_STOP	21	// "HOMING: end stop reached - reversing"
+#define MSG_HOME_1T_CLEAR	22	// "HOMING: clear of end stop - searching"
+#define MSG_HOME_1T_FOUND	23	// "HOMING: REF found - stage datum set"
+#define MSG_HOME_1T_FAIL	24	// "HOMING failed: REF mark never seen"
+#define MSG_HOME_1T_JAM		25	// "HOMING failed: stage jammed on end stop"
+#define MSG_HOME_1T_TMO		26	// "HOMING failed: stage timed out"
+#define MSG_HOME_1T_SKIP	27	// "HOMING: stage homing disabled - skipped"
+#define MSG_HOME_ALIGN		28	// "HOMING: capturing datum - aligning IK"
+#define MSG_HOME_DONE		29	// "HOMED - ready to move"
+#define MSG_HOME_ABORT		30	// "HOMING: aborted"
+#define MSG_HOME_DIVERGE	31	// "HOMING STOPPED: error growing - check HOME_DIR"
+#define MSG_HOME_FAR		32	// "HOMING STOPPED: arm travelled too far"
+// --- moving -------------------------------------------------------------
+#define MSG_MOVE_CMD		40	// "MOVE: command accepted"
+#define MSG_MOVE_RUN		41	// "MOVE: running"
+#define MSG_MOVE_DONE		42	// "MOVE: complete"
+#define MSG_MOVE_NO_HOME	43	// "MOVE refused: press HOME first"
+#define MSG_MOVE_PSI_LIM	44	// "MOVE refused: psi outside the workspace"
+#define MSG_MOVE_PHI_LIM	45	// "MOVE refused: phi outside the workspace"
+#define MSG_MOVE_THN_LIM	46	// "MOVE refused: theta_n outside travel"
+#define MSG_MOVE_TOOL_LIM	47	// "MOVE refused: tool outside travel"
+#define MSG_TRAJ_SINGLE		60	// "TRAJECTORY: running once"
+#define MSG_TRAJ_CONT		61	// "TRAJECTORY: running continuously"
+#define MSG_TRAJ_DONE		62	// "TRAJECTORY: complete"
+#define MSG_TRAJ_STOP		63	// "TRAJECTORY: stopped"
+#define MSG_TRAJ_EMPTY		64	// "TRAJECTORY refused: nothing loaded"
+#define MSG_TRAJ_LIM		65	// "TRAJECTORY stopped: a point is out of limits"
+#define MSG_MOVE_SLOWED		49	// "MOVE: slowed to keep the stage within its limit"
+// --- faults and warnings ------------------------------------------------
+#define MSG_STOP			50	// "STOPPED"
+#define MSG_ERROR			51	// "ERROR - drives off - press CLR ERR"
+#define MSG_ERR_CLR			52	// "Error cleared - press HOME"
+#define MSG_WARN_STALE		53	// "WARNING: sensor data has gone stale"
+#define MSG_WARN_SING		54	// "WARNING: IK singular - pose held"
+#define MSG_WARN_SURPASS	55	// "WARNING: leg lap risk - legs far apart"
+#define MSG_CAN_RESET		56	// "CAN receivers re-armed"
+
+#endif // _3R1T_CONFIG_MH_

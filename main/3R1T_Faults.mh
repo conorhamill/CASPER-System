@@ -1,0 +1,777 @@
+//=========================================================================
+// 3R1T_Faults.mh
+//
+// Everything that turns a fault into a sentence. Decoders and dump
+// routines only - nothing in here decides what the rig should do next,
+// which is why it is a header and not part of the program.
+//
+//   3R1T_Config.mh      constants
+//   3R1T_Globals.mh     variables + bit shuffling
+//   3R1T_Faults.mh      <- you are here   fault decoding and reporting
+//   3R1T_Kin_3R.mh      3R spherical IK
+//   3R1T_Kin_1T.mh      1T tool IK
+//   QUB_3R1T_Traj.mc    the program
+//
+//
+// >>> WHAT ERROR 40 ACTUALLY IS. <<<
+//
+// 40 is F_AMP, "Amplifier error", and it is not a fault in the controller
+// at all. It means one of the EPOS4 drives raised its own fault and the
+// controller noticed - the statusword came back with the fault bit set.
+// So the number 40 carries no information beyond "a drive is unhappy". It
+// is the same 40 for a following error, an overcurrent, a lost CAN frame
+// and a mains dip.
+//
+// THE ANSWER IS IN THE DRIVE, in object 0x603F, and that is what these
+// routines go and fetch. A run that dies with "error 40" and nothing else
+// is unfixable; the same run with "EPOS4 node 4: 0x8611 following error"
+// tells you where to look.
+//
+//
+// >>> AND THE HISTORY MATTERS MORE THAN THE LATEST CODE. <<<
+//
+// 0x603F holds the CURRENT error. Object 0x1003 holds the last several in
+// order, newest first, and for an intermittent fault that ordering is
+// usually the whole diagnosis: one root cause followed by a cascade of
+// consequences reads completely differently from four unrelated events.
+// A following error caused by a CAN dropout, for instance, shows up as
+// 0x8130 then 0x8611 - the other way round from what the live code says.
+//
+// Each entry is 32 bits: the low half is the error code, the high half is
+// Maxon's own extra information.
+//
+//
+// >>> THESE ROUTINES TALK TO THE DRIVES OVER CAN. <<<
+//
+// Which is exactly the thing that may be broken. Every SdoRead here can
+// itself fail if the bus is down, and a failed SdoRead raises another
+// ApossC error. The order is deliberate: the code that matters most -
+// 0x603F on each drive - is read FIRST, so a dump that dies half way
+// through has still printed the useful line. The history is read last.
+//=========================================================================
+
+#ifndef _3R1T_FAULTS_MH_
+#define _3R1T_FAULTS_MH_
+
+
+///////////////////////////////////////////////////////////////////////////
+// The CAN node behind an axis. The pairing is fixed by the CANopen setup
+// in SECTION 1 of Config; this is the only place it is inverted.
+///////////////////////////////////////////////////////////////////////////
+long DriveNode(long ax)
+{
+	if (ax == C_AXIS1)    { return(C_DRIVE_BUSID1); }
+	if (ax == C_AXIS2)    { return(C_DRIVE_BUSID2); }
+	if (ax == C_AXIS3)    { return(C_DRIVE_BUSID3); }
+	if (ax == C_AXIS_1T)  { return(C_DRIVE_BUSID_1T); }
+	return(0);
+}
+
+
+// What the drive is FOR, in words, so a node number does not have to be
+// looked up in Config while something is on fire.
+void PrintDriveName(long node)
+{
+	if (node == C_DRIVE_BUSID1)   { print("   node ",node," = arm 1"); return; }
+	if (node == C_DRIVE_BUSID2)   { print("   node ",node," = arm 2"); return; }
+	if (node == C_DRIVE_BUSID3)   { print("   node ",node," = arm 3"); return; }
+	if (node == C_DRIVE_BUSID_1T) { print("   node ",node," = the STAGE (translation)"); return; }
+	print("   node ",node," = unknown");
+}
+
+
+// Remember what a drive was complaining of BEFORE start-up cleared it.
+//
+// >>> A ZERO NEVER OVERWRITES A REAL CODE. <<<
+//
+// Two callers, and they run in this order: ClearLeftoverDriveFaults reads
+// the reason and then wipes it, and CheckOneDrive looks again afterwards -
+// by which time 0x603F reads 0x0000. Without this guard the second caller
+// would stash that zero over the top of the only record of what happened,
+// which is the exact failure this whole mechanism exists to prevent.
+void StashBootError(long node, long code)
+{
+	if (code == 0) { return; }
+
+	if (node == C_DRIVE_BUSID1)   { g_boot_err1 = code; return; }
+	if (node == C_DRIVE_BUSID2)   { g_boot_err2 = code; return; }
+	if (node == C_DRIVE_BUSID3)   { g_boot_err3 = code; return; }
+	if (node == C_DRIVE_BUSID_1T) { g_boot_err4 = code; return; }
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// The DS402 statusword, in words.
+//
+// The state is the bottom bits with a fixed set of masks - see CiA 402.
+// 0x27 is the only one that means the drive is actually driving; anything
+// else and the setpoints being streamed at it are going nowhere.
+///////////////////////////////////////////////////////////////////////////
+void PrintDs402State(long sw)
+{
+	print("   statusword ",radixstr(sw, 16));
+
+	if ((sw & 0x4F) == 0x00) { print("     state: not ready to switch on"); }
+	if ((sw & 0x4F) == 0x40) { print("     state: switch on disabled"); }
+	if ((sw & 0x6F) == 0x21) { print("     state: ready to switch on"); }
+	if ((sw & 0x6F) == 0x23) { print("     state: switched on (not driving)"); }
+	if ((sw & 0x6F) == 0x27) { print("     state: OPERATION ENABLED - driving"); }
+	if ((sw & 0x6F) == 0x07) { print("     state: quick stop active"); }
+	if ((sw & 0x4F) == 0x0F) { print("     state: FAULT REACTION ACTIVE"); }
+	if ((sw & 0x4F) == 0x08) { print("     state: FAULT"); }
+
+	if ((sw & 0x0080) != 0) { print("     bit 7  WARNING is set - the drive is complaining but still running"); }
+	if ((sw & 0x0800) != 0) { print("     bit 11 internal limit active - current, voltage or position limit reached"); }
+	if ((sw & 0x2000) != 0) { print("     bit 13 following error"); }
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// An EPOS4 error code, in words.
+//
+// Grouped the way the causes group, not the way the numbers do, because
+// the first question is always "is it the motor, the wiring, the bus or
+// me". The names come from SDK_Amplifier_Epos4.mh; the sentences after
+// them are what to go and look at.
+///////////////////////////////////////////////////////////////////////////
+void PrintEpos4Fault(long code)
+{
+	if (code == EPOS4_F_NO_ERROR) { print("     0x0000 no error recorded"); return; }
+
+	print("     code ",radixstr(code, 16));
+
+	switch (code) {
+		// --- the motor and its wiring ---------------------------------
+		case EPOS4_F_OVERCURRENT:
+			print("     OVERCURRENT - short, or the motor stalled against something");
+			break;
+		case EPOS4_F_POWER_STAGE_PROTECTION:
+			print("     power stage protection - the output tripped");
+			break;
+		case EPOS4_F_THERMAL_OVERLOAD:
+			print("     drive THERMAL overload - the EPOS4 itself is too hot");
+			break;
+		case EPOS4_F_THERMAL_MOTOR_OVERLOAD:
+			print("     MOTOR thermal overload - it has been pushing too hard for too long");
+			break;
+
+		// --- the supply -----------------------------------------------
+		case EPOS4_F_OVERVOLTAGE:
+			print("     OVERVOLTAGE - regenerated energy with nowhere to go. Decelerating a load too fast does this");
+			break;
+		case EPOS4_F_UNDERVOLTAGE:
+			print("     UNDERVOLTAGE - the supply sagged. Check it can take all four drives accelerating at once");
+			break;
+		case EPOS4_F_LOGIC_VOLTAGE_LOW:
+			print("     logic supply too low");
+			break;
+
+		// --- the feedback ---------------------------------------------
+		case EPOS4_F_POSITION_SENSOR:
+			print("     POSITION SENSOR - encoder wiring, shielding, or a loose coupling");
+			break;
+		case EPOS4_F_POSITION_BREACH:
+			print("     position breach");
+			break;
+		case EPOS4_F_HALL_SENSOR:
+			print("     HALL SENSOR - hall wiring or a bad connector");
+			break;
+		case EPOS4_F_MISSING_MAIN_SENSOR:
+			print("     missing main sensor");
+			break;
+		case EPOS4_F_MAIN_SENSOR_DIR:
+			print("     main sensor direction - encoder counting the wrong way for the motor");
+			break;
+
+		// --- the loop -------------------------------------------------
+		case EPOS4_F_FOLLOWING:
+			print("     FOLLOWING ERROR - the motor could not keep up with the setpoint.");
+			print("     Not enough torque, or something is binding.");
+			print("     >>> CHECK THE LIMITS TABLE BELOW BEFORE ANYTHING ELSE. <<<");
+			print("     A drive whose nominal current or max speed differs from its");
+			print("     neighbours is commissioned for a different motor, makes different");
+			print("     torque at the same current, and will always be the one that trips.");
+			print("     Speed and acceleration are worth a look only after the four rows match.");
+			break;
+		case EPOS4_F_SOFTWARE_POSITION_LIMIT:
+			print("     software position limit reached");
+			break;
+		case EPOS4_F_CONTROLLER_GAIN:
+			print("     controller gain - the tuning is unstable");
+			break;
+		case EPOS4_F_SYSTEM_OVERLOADED:
+			print("     system overloaded");
+			break;
+		case EPOS4_F_SYSTEM_PEAK_OVERLOADED:
+			print("     system PEAK overloaded - a short, hard demand rather than a sustained one");
+			break;
+
+		// --- the bus --------------------------------------------------
+		case EPOS4_F_CAN_OVERRUN_OBJ_LOST:
+			print("     CAN OVERRUN, object lost - frames arrived faster than they were consumed");
+			break;
+		case EPOS4_F_CAN_OVERRUN:
+			print("     CAN overrun");
+			break;
+		case EPOS4_F_CAN_PASSIVE_MODE:
+			print("     CAN passive mode - the drive has seen too many bus errors. Wiring or termination");
+			break;
+		case EPOS4_F_CAN_HEARTBEAT:
+			print("     CAN HEARTBEAT lost - the drive stopped hearing the controller");
+			break;
+		case EPOS4_F_CAN_BUS_OFF:
+			print("     CAN BUS OFF - the drive took itself off the bus. Termination, screening, or baud rate");
+			break;
+		case EPOS4_F_CAN_RX_QUEUE:
+			print("     CAN receive queue overflow");
+			break;
+		case EPOS4_F_CAN_TX_QUEUE:
+			print("     CAN transmit queue overflow");
+			break;
+		case EPOS4_F_CAN_PDO_LENGTH:
+			print("     CAN PDO length wrong - a mapping mismatch");
+			break;
+		case EPOS4_F_RPDO_TIMEOUT:
+			print("     RPDO TIMEOUT - the cyclic setpoint stream stopped arriving.");
+			print("     The 2 ms kinematics interrupt is what feeds it - see PeriodRoutine");
+			break;
+
+		// --- everything else ------------------------------------------
+		case EPOS4_F_STO:
+			print("     STO - safe torque off is active. Check the STO wiring and jumpers");
+			break;
+		case EPOS4_F_WATCHDOG:
+			print("     watchdog");
+			break;
+		case EPOS4_F_SIGN_OF_LIFE:
+			print("     sign of life - the cyclic master stopped being seen");
+			break;
+		case EPOS4_F_SOFTWARE_PARAM:
+			print("     software parameter - a configured value is out of range");
+			break;
+		case EPOS4_F_GENERIC:
+			print("     generic error");
+			break;
+		default:
+			print("     not in the table here - look it up in the EPOS4 firmware manual");
+	}
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// One drive, completely.
+//
+// >>> ORDER IS DELIBERATE. <<< 0x603F first, because it is the answer;
+// then the statusword, which says whether the drive is still driving; then
+// the register and the history, which are the nice-to-haves. Every line is
+// a CAN transaction and the bus may be the thing that is broken, so the
+// useful line is printed before anything that could hang.
+///////////////////////////////////////////////////////////////////////////
+void DumpDrive(long node)
+{
+#if (AXES_MODE != SIM_MODE)
+	long code, sw, reg, fe, n, i, entry;
+
+	PrintDriveName(node);
+
+	code = SdoRead(node, EPOS4_ERROR_CODE, 0x00);
+	PrintEpos4Fault(code);
+
+	sw = SdoRead(node, EPOS4_STATUSWORD, 0x00);
+	PrintDs402State(sw);
+
+	reg = SdoRead(node, EPOS4_ERROR_REGISTER, 0x00);
+	if (reg != 0) { print("   error register ",radixstr(reg, 16)); }
+
+	// How far behind its setpoint the drive was, against the window it is
+	// allowed. Printed even when it reads zero, because it usually DOES
+	// read zero on the drive that just tripped - the EPOS4 clears it
+	// entering FAULT - and a reader needs to know that is what happened
+	// rather than wonder why the line is missing.
+	fe = SdoRead(node, EPOS4_FOLLOWING_ERROR_ACTUAL_VALUE, 0x00);
+	print("   following error ",fe," qc (0 after a trip - the drive clears it)");
+
+	// The history. Newest first, and the OLDEST of these is usually the
+	// root cause - everything after it is the cascade.
+	n = SdoRead(node, EPOS4_ERROR_HISTORY, 0x00);
+	if (n > C_FAULT_HISTORY_DEPTH) { n = C_FAULT_HISTORY_DEPTH; }
+	if (n > 0) {
+		print("   history, newest first:");
+		for (i = 1; i <= n; i++) {
+			entry = SdoRead(node, EPOS4_ERROR_HISTORY, i);
+			print("    [",i,"] ",radixstr(entry & 0xFFFF, 16)," (info ",radixstr((entry >> 16) & 0xFFFF, 16),")");
+			PrintEpos4Fault(entry & 0xFFFF);
+		}
+	}
+#endif
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// >>> WHAT EACH DRIVE IS CONFIGURED TO ALLOW. <<<
+//
+// Printed as four comparable rows on purpose. When the same arm faults
+// every time and the other two never do, the first question is not "how
+// hard is it working" but "is it set up like its neighbours" - and four
+// rows side by side answers that without any theory at all.
+//
+// 0x3001 is the EPOS4's motor data. Sub 2 is the OUTPUT CURRENT LIMIT, the
+// peak, and it is the one this program writes. Sub 1 is the NOMINAL
+// current, the continuous rating, and it is the one the drive's thermal
+// model derates against - so a drive can sit inside its peak limit and
+// still be throttled to a fraction of it after a few seconds of real work.
+// Raising the peak and leaving the nominal alone would look exactly like
+// raising it and nothing happening.
+//
+// Sub 3 is the winding thermal time constant, which is how fast that
+// derating comes on.
+///////////////////////////////////////////////////////////////////////////
+void DumpDriveLimits(long node)
+{
+#if (AXES_MODE != SIM_MODE)
+	long nom, peak, tau, few, spd, pmin, pmax, abrt;
+
+	nom  = SdoRead(node, EPOS4_MOTOR_DATA, 1);
+	peak = SdoRead(node, EPOS4_MOTOR_DATA, 2);
+	tau  = SdoRead(node, EPOS4_MOTOR_DATA, 3);
+	few  = SdoRead(node, EPOS4_FOLLOWING_ERROR_WINDOW, 0x00);
+	spd  = SdoRead(node, EPOS4_MAX_MOTOR_SPEED, 0x00);
+	pmin = SdoRead(node, EPOS4_SOFTWARE_POSITION_LIMIT, 1);
+	pmax = SdoRead(node, EPOS4_SOFTWARE_POSITION_LIMIT, 2);
+	abrt = SdoRead(node, EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00);
+	print("   node ",node,"  nominal ",nom," mA  peak ",peak," mA  tau ",tau," s  FE window ",few," qc  max ",spd," rpm  soft pos ",pmin," .. ",pmax,"  abort-conn ",abrt);
+#endif
+}
+
+
+void DumpAllLimits(void)
+{
+#if (AXES_MODE != SIM_MODE)
+	print("---- configured limits: COMPARE THE FOUR ROWS ----");
+	DumpDriveLimits(C_DRIVE_BUSID1);
+	DumpDriveLimits(C_DRIVE_BUSID2);
+	DumpDriveLimits(C_DRIVE_BUSID3);
+	DumpDriveLimits(C_DRIVE_BUSID_1T);
+	print("   nominal is the CONTINUOUS rating and the one the thermal model derates against;");
+	print("   peak is what this program writes. A row that differs from its neighbours is the answer.");
+	print("--------------------------------------------------");
+#endif
+}
+
+
+// All four, in node order. Which drive reported the fault is not always
+// the drive that CAUSED it - a supply sag or a bus problem takes several
+// down at once, and the pattern across the four is what tells them apart.
+void DumpAllDrives(void)
+{
+#if (AXES_MODE != SIM_MODE)
+	print("---- EPOS4 drives ----");
+	DumpDrive(C_DRIVE_BUSID1);
+	DumpDrive(C_DRIVE_BUSID2);
+	DumpDrive(C_DRIVE_BUSID3);
+	DumpDrive(C_DRIVE_BUSID_1T);
+	print("----------------------");
+#else
+	print("---- SIM_MODE: no drives to interrogate ----");
+#endif
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// The first non-zero 0x603F across the four drives, and which node it was
+// on. Written into the fault snapshot so the panel and any SDO client can
+// read the actual cause without scraping the terminal.
+//
+// Returns the node, or 0 if every drive says it is fine - which is itself
+// worth knowing, because it means the fault was on the controller side.
+///////////////////////////////////////////////////////////////////////////
+// One drive: if it is reporting a fault, latch it and say so.
+long LatchIfFaulted(long node)
+{
+#if (AXES_MODE != SIM_MODE)
+	long code;
+
+	code = SdoRead(node, EPOS4_ERROR_CODE, 0x00);
+	if (code == 0) { return(FALSE); }
+
+	USER_PARAM(USR_FAULT_NODE) = node;
+	USER_PARAM(USR_FAULT_EPOS) = code;
+	USER_PARAM(USR_FAULT_SW)   = SdoRead(node, EPOS4_STATUSWORD, 0x00);
+	return(TRUE);
+#else
+	return(FALSE);
+#endif
+}
+
+// Written out one drive per line rather than looped over node id, because
+// the node numbers are a configuration choice in Config and nothing says
+// they have to stay 1..4 in that order.
+long FindFaultingDrive(void)
+{
+	USER_PARAM(USR_FAULT_NODE) = 0;
+	USER_PARAM(USR_FAULT_EPOS) = 0;
+	USER_PARAM(USR_FAULT_SW)   = 0;
+
+	if (LatchIfFaulted(C_DRIVE_BUSID1)   == TRUE) { return(C_DRIVE_BUSID1); }
+	if (LatchIfFaulted(C_DRIVE_BUSID2)   == TRUE) { return(C_DRIVE_BUSID2); }
+	if (LatchIfFaulted(C_DRIVE_BUSID3)   == TRUE) { return(C_DRIVE_BUSID3); }
+	if (LatchIfFaulted(C_DRIVE_BUSID_1T) == TRUE) { return(C_DRIVE_BUSID_1T); }
+	return(0);
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// The state the rig was in, in words. Set by every state's SIG_ENTRY, so
+// a fault snapshot can say WHEN as well as what.
+///////////////////////////////////////////////////////////////////////////
+void PrintStateName(long st)
+{
+	switch (st) {
+		case ST_STARTUP:  print("   during: Startup"); break;
+		case ST_NOTHOMED: print("   during: NotHomed"); break;
+		case ST_HOMING:   print("   during: HOMING"); break;
+		case ST_READY:    print("   during: Ready (standing still)"); break;
+		case ST_MOVING:   print("   during: a MOVE"); break;
+		case ST_TRAJ:     print("   during: a TRAJECTORY"); break;
+		case ST_FAULT:    print("   during: Fault (a second fault while already faulted)"); break;
+		default:          print("   during: unknown");
+	}
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// >>> CLEAR A LEFTOVER DRIVE FAULT BEFORE THE CONTROLLER EVER SEES IT. <<<
+//
+// This is the whole reason the FIRST execute after a program reload failed
+// and the second worked.
+//
+// The IDE stops a program without letting it shut anything down, so the
+// drives are left enabled and the controller's CAN goes quiet underneath
+// them. They come up in FAULT - 0x8120, CAN passive mode, on all four at
+// once. Startup then calls AxisControl(ON), which begins the DS402
+// handshake, the controller reads a fault bit back, and raises error 40 -
+// which takes the whole startup into Fault BEFORE CheckDrivesEnabled has
+// had any chance to clear it. The clearing worked; it just happened too
+// late to matter. Second execute was clean because the first one had
+// cleared the drives on its way past.
+//
+// Clearing first costs three SDO writes per faulted drive and makes the
+// second execute unnecessary.
+//
+// The reset is a RISING EDGE on controlword bit 7, which is why it is
+// written low, high, low - the same sequence the SDK's own DS402 state
+// machine uses. It goes over SDO rather than through AmpErrorClear because
+// this runs before AxisControl(ON), when the axis module has not started
+// its handshake yet.
+///////////////////////////////////////////////////////////////////////////
+long ClearIfFaulted(long node)
+{
+#if (AXES_MODE != SIM_MODE)
+	long sw, ec;
+
+	sw = SdoRead(node, EPOS4_STATUSWORD, 0x00);
+	if ((sw & 0x0008) == 0) { return(FALSE); }
+
+	// Remember what it was before it is wiped - this is the only record.
+	ec = SdoRead(node, EPOS4_ERROR_CODE, 0x00);
+	StashBootError(node, ec);
+	print("Startup: node ",node," came up FAULTED  sw=",radixstr(sw, 16),"  err=",radixstr(ec, 16));
+	PrintEpos4Fault(ec);
+
+	SdoWrite(node, EPOS4_CONTROLWORD, 0x00, 0x0000);
+	SdoWrite(node, EPOS4_CONTROLWORD, 0x00, 0x0080);
+	SdoWrite(node, EPOS4_CONTROLWORD, 0x00, 0x0000);
+	return(TRUE);
+#else
+	return(FALSE);
+#endif
+}
+
+
+void ClearLeftoverDriveFaults(void)
+{
+#if (AXES_MODE != SIM_MODE)
+	long n;
+
+	n = 0;
+	if (ClearIfFaulted(C_DRIVE_BUSID1)   == TRUE) { n = n + 1; }
+	if (ClearIfFaulted(C_DRIVE_BUSID2)   == TRUE) { n = n + 1; }
+	if (ClearIfFaulted(C_DRIVE_BUSID3)   == TRUE) { n = n + 1; }
+	if (ClearIfFaulted(C_DRIVE_BUSID_1T) == TRUE) { n = n + 1; }
+
+	if (n == 0) { return; }
+
+	print("Startup: cleared a leftover fault on ",n," drive(s) before enabling them");
+	print("   All four at once is a bus or supply event at the last shutdown, not four sick drives.");
+	Delay(200);
+	ErrorClear();
+#endif
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Write 0x6007 to all four, if Config asks for it.
+//
+// See the note beside C_ABORT_CONN_OPTION - what it means, why it might
+// help with a drive that comes up faulted after a program reload, and why
+// it is off by default. The value each drive holds is printed either way,
+// because the first useful thing is knowing what it already is.
+///////////////////////////////////////////////////////////////////////////
+void ApplyAbortConnOption(void)
+{
+#if (AXES_MODE != SIM_MODE)
+	long a1, a2, a3, a4;
+
+#if (C_ABORT_CONN_OPTION >= 0)
+	SdoWrite(C_DRIVE_BUSID1,   EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00, C_ABORT_CONN_OPTION);
+	SdoWrite(C_DRIVE_BUSID2,   EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00, C_ABORT_CONN_OPTION);
+	SdoWrite(C_DRIVE_BUSID3,   EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00, C_ABORT_CONN_OPTION);
+	SdoWrite(C_DRIVE_BUSID_1T, EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00, C_ABORT_CONN_OPTION);
+	print("Abort connection option 0x6007 set to ",C_ABORT_CONN_OPTION," on all four drives");
+#endif
+
+	a1 = SdoRead(C_DRIVE_BUSID1,   EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00);
+	a2 = SdoRead(C_DRIVE_BUSID2,   EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00);
+	a3 = SdoRead(C_DRIVE_BUSID3,   EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00);
+	a4 = SdoRead(C_DRIVE_BUSID_1T, EPOS4_ABORT_CONNECTION_OPTION_CODE, 0x00);
+	print("Abort connection option 0x6007 now reads ",a1,"/",a2,"/",a3,"/",a4," (0 none, 1 fault, 2 disable voltage, 3 quick stop)");
+#endif
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// >>> ARE THE FOUR DRIVES SET UP THE SAME? ASK AT STARTUP. <<<
+//
+// This rig ran for a long time with arm 1 commissioned for a different
+// motor from the other three - 1490 mA nominal against 2660, and 9250 rpm
+// against 5000. It presented as an intermittent "error 40" that always
+// picked the same arm, and it took three faults and a purpose-built dump
+// to find. One line at startup would have caught it on the first boot.
+//
+// Compares nodes 2, 3 and 4 against node 1 and says so if they differ. It
+// does not know which is CORRECT - only that they disagree, which is the
+// part that can be checked without opening anything.
+void CheckDriveMatch(void)
+{
+#if (AXES_MODE != SIM_MODE)
+	long n1, s1, n2, s2, n3, s3, n4, s4, bad;
+
+	n1 = SdoRead(C_DRIVE_BUSID1,   EPOS4_MOTOR_DATA, 1);
+	s1 = SdoRead(C_DRIVE_BUSID1,   EPOS4_MAX_MOTOR_SPEED, 0x00);
+	n2 = SdoRead(C_DRIVE_BUSID2,   EPOS4_MOTOR_DATA, 1);
+	s2 = SdoRead(C_DRIVE_BUSID2,   EPOS4_MAX_MOTOR_SPEED, 0x00);
+	n3 = SdoRead(C_DRIVE_BUSID3,   EPOS4_MOTOR_DATA, 1);
+	s3 = SdoRead(C_DRIVE_BUSID3,   EPOS4_MAX_MOTOR_SPEED, 0x00);
+	n4 = SdoRead(C_DRIVE_BUSID_1T, EPOS4_MOTOR_DATA, 1);
+	s4 = SdoRead(C_DRIVE_BUSID_1T, EPOS4_MAX_MOTOR_SPEED, 0x00);
+
+	bad = 0;
+	if (n2 != n1 || s2 != s1) { bad = 1; }
+	if (n3 != n1 || s3 != s1) { bad = 1; }
+	if (n4 != n1 || s4 != s1) { bad = 1; }
+	if (bad == 0) {
+		print("Drives: all four commissioned alike - nominal ",n1," mA, max ",s1," rpm");
+		return;
+	}
+
+	print("");
+	print("*** THE FOUR DRIVES ARE NOT COMMISSIONED ALIKE ***");
+	print("   node ",C_DRIVE_BUSID1,"  nominal ",n1," mA   max ",s1," rpm");
+	print("   node ",C_DRIVE_BUSID2,"  nominal ",n2," mA   max ",s2," rpm");
+	print("   node ",C_DRIVE_BUSID3,"  nominal ",n3," mA   max ",s3," rpm");
+	print("   node ",C_DRIVE_BUSID_1T,"  nominal ",n4," mA   max ",s4," rpm");
+	print("   Different motor data means different torque at the same current,");
+	print("   so the odd one out will be the one that trips a following error");
+	print("   first and the whole rig is limited by it. Check the motor labels");
+	print("   against what each drive is configured for before chasing speeds,");
+	print("   accelerations or current limits.");
+	print("");
+#endif
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// >>> THE SNAPSHOT. CALLED FIRST, FROM SIG_ERROR. <<<
+//
+// ErrorNo(), ErrorAxis() and ErrorInfo() report the LAST error, and any
+// command issued after the fault can overwrite them - including the
+// AxisControl(OFF) that the fault state does on its way in. Reading them
+// later than this is reading whatever happened since.
+//
+// Nothing here touches CAN. It is all controller-side state, so it cannot
+// hang and cannot fail, which is what makes it safe to do before the
+// drives have been made safe. The CAN interrogation happens afterwards.
+///////////////////////////////////////////////////////////////////////////
+void CaptureFault(void)
+{
+	g_errNo   = ErrorNo();
+	g_errAxis = ErrorAxis();
+	g_errInfo = ErrorInfo();
+
+	g_fault_count = g_fault_count + 1;
+	g_fault_ms    = Time();
+	g_fault_state = g_state_id;
+
+	// >>> ONLY MEANINGFUL DURING A TRAJECTORY. <<<
+	// USR_TRAJ_STEP keeps whatever the last run finished on, so reading it
+	// unconditionally made a fault during a plain MOVE report "trajectory
+	// step 81 of 81" - a step number from a run that ended minutes before.
+	g_fault_step = 0;
+	if (g_state_id == ST_TRAJ) { g_fault_step = USER_PARAM(USR_TRAJ_STEP); }
+
+	// Where the four pose channels were aimed and where they had got to.
+	// A fault that always happens at the same pose is a mechanism problem;
+	// one scattered all over the workspace is not.
+	g_fault_psi  = Cpos(EE_PSI);
+	g_fault_phi  = Cpos(EE_PHI);
+	g_fault_thn  = Cpos(EE_THETA_N);
+	g_fault_tool = Cpos(EE_TOOL);
+
+	// Before TrajRun's SIG_EXIT puts the panel's numbers back over them.
+	g_fault_rot_vel  = USER_PARAM(USR_MOVE_VEL);
+	g_fault_rot_acc  = USER_PARAM(USR_MOVE_ACC);
+	g_fault_tool_vel = USER_PARAM(USR_TOOL_VEL);
+	g_fault_tool_acc = USER_PARAM(USR_TOOL_ACC);
+
+	USER_PARAM(USR_ERROR_NO)     = g_errNo;
+	USER_PARAM(USR_ERROR_INFO)   = g_errInfo;
+	USER_PARAM(USR_FAULT_COUNT)  = g_fault_count;
+	USER_PARAM(USR_FAULT_AXIS)   = g_errAxis;
+	USER_PARAM(USR_FAULT_STATE)  = g_fault_state;
+	USER_PARAM(USR_FAULT_STEP)   = g_fault_step;
+	USER_PARAM(USR_FAULT_MS)     = g_fault_ms;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// The whole report, printed once on the way into Fault.
+//
+// Written to be read by somebody who was not watching when it happened,
+// which is the situation an intermittent fault always leaves you in.
+///////////////////////////////////////////////////////////////////////////
+void ReportFault(void)
+{
+	print("");
+	print("========================================================");
+	print(" FAULT ",g_fault_count," at ",g_fault_ms," ms since power-up");
+	print("========================================================");
+
+	print("   ApossC error ",g_errNo,"  info ",g_errInfo,"  axis ",g_errAxis);
+	printf("   -> ");
+	sdkErrorPrint_ApossIdeErrorDescription(g_errNo);
+	printf("\n");
+
+	if (g_errNo == F_AMP) {
+		print("   Error 40 is F_AMP. It means A DRIVE FAULTED, not that the");
+		print("   controller did. The reason is in the drive - see below.");
+	}
+	if (g_errNo == F_POSERR) {
+		print("   Track error limit: the axis fell further behind its setpoint");
+		print("   than POSERR allows. See C_AXIS_TRACKERR / C_AXIS_1T_TRACKERR.");
+	}
+	if (g_errNo == F_CANIO) {
+		printf("   SDO abort code 0x%lx\n", SYS_PROCESS(SYS_CANOM_SDOABORT));
+		sdkErrorPrint_SdoErrorDescription(SYS_PROCESS(SYS_CANOM_SDOABORT));
+		printf("\n");
+	}
+
+	// >>> ErrorInfo() FOR F_AMP IS THE FAULTING DRIVE'S STATUSWORD. <<<
+	// Not documented as such anywhere, but confirmed on this rig twice:
+	// info 520 = 0x0208 and info 8712 = 0x2208, each exactly the
+	// statusword the drive was reporting. It is the fastest read of what
+	// the drive was doing, and unlike the SDO reads below it costs nothing
+	// and cannot fail.
+	if (g_errNo == F_AMP) {
+		print("   info decoded as that drive's statusword:");
+		PrintDs402State(g_errInfo);
+	}
+
+	PrintStateName(g_fault_state);
+	if (g_fault_step > 0) { print("   trajectory step ",g_fault_step," of ",USER_PARAM(USR_TRAJ_LEN)); }
+	print("   pose at the fault: psi=",g_fault_psi," phi=",g_fault_phi," theta_n=",g_fault_thn," tool=",g_fault_tool," (cdeg / 0.01 mm)");
+	print("   sensors: theta stale=",USER_PARAM(USR_THETA_STALE)," enc stale=",USER_PARAM(USR_ENC_STALE)," IK singular=",USER_PARAM(USR_IK_SINGULAR));
+
+	DumpAllDrives();
+
+	// What start-up had to clear before the rig would run. Silent
+	// otherwise, so a report that shows four clean drives does not look
+	// like a report on a machine that booted clean.
+	if (g_boot_err1 != 0 || g_boot_err2 != 0 || g_boot_err3 != 0 || g_boot_err4 != 0) {
+		print("---- and this is what start-up CLEARED to get going ----");
+		print("   node ",C_DRIVE_BUSID1," ",radixstr(g_boot_err1, 16),"   node ",C_DRIVE_BUSID2," ",radixstr(g_boot_err2, 16),"   node ",C_DRIVE_BUSID3," ",radixstr(g_boot_err3, 16),"   node ",C_DRIVE_BUSID_1T," ",radixstr(g_boot_err4, 16));
+		print("   The same code on ALL FOUR is a bus or supply event, not four sick drives.");
+	}
+
+	DumpAllLimits();
+
+	// >>> THE LATCHED PROFILE, NOT THE LIVE SLOTS. <<< See the note in
+	// Globals: by the time this runs, a trajectory's SIG_EXIT has already
+	// put the panel's speeds back, so reading them here would report the
+	// panel profile for a run that was not using it.
+	print("   profile ACTUALLY in force at the fault: rotation ",g_fault_rot_vel,"/",g_fault_rot_acc," cdeg/s, translation ",g_fault_tool_vel,"/",g_fault_tool_acc," (0.01 mm/s)");
+
+	print(" Read USER_PARAM 90..97 over SDO for the same thing in numbers.");
+	print("========================================================");
+	print("");
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// >>> THE EARLY WARNING. <<<
+//
+// A drive that is about to fault usually says so first. Statusword bit 7
+// is the drive's own warning flag and bit 11 is "internal limit active" -
+// current, voltage or position. Either can be set for seconds before the
+// fault, and neither stops anything, so nothing else in this program would
+// ever mention them.
+//
+// For a fault that happens every few minutes this is the difference
+// between a post-mortem and watching it build. Called once a second from
+// SIG_TOGGLE; costs four SDO reads a second against a bus carrying 500
+// PDO cycles a second, so it is not free but it is close.
+//
+// >>> IF THE BUS ITSELF IS THE SUSPECT, TURN THIS OFF. <<<
+// Set C_DRIVE_HEALTH_POLL to 0 in Config. Adding SDO traffic to a bus you
+// think is marginal is a way to change what you are trying to measure.
+///////////////////////////////////////////////////////////////////////////
+// One drive. Takes the flags last seen on it and hands back the flags
+// seen now, so the caller can keep them in a plain long - see the note in
+// 3R1T_Globals.mh about why these are four scalars and not an array.
+long CheckDriveWarn(long node, long prev)
+{
+#if (AXES_MODE != SIM_MODE)
+	long sw, flags;
+
+	sw    = SdoRead(node, EPOS4_STATUSWORD, 0x00);
+	flags = sw & 0x0880;			// bit 7 warning, bit 11 internal limit
+
+	// Announced on the EDGE only. Posted every second they would bury
+	// everything else in the terminal, which is the one place the answer
+	// is going to appear.
+	if (flags == prev) { return(flags); }
+
+	if (flags != 0) {
+		print("DRIVE WARNING at ",Time()," ms - this often comes before the fault:");
+		PrintDriveName(node);
+		PrintDs402State(sw);
+	} else {
+		print("Drive ",node,": warning cleared at ",Time()," ms");
+	}
+	return(flags);
+#else
+	return(0);
+#endif
+}
+
+
+void PollDriveHealth(void)
+{
+#if (C_DRIVE_HEALTH_POLL == 1)
+	g_warn_d1 = CheckDriveWarn(C_DRIVE_BUSID1,   g_warn_d1);
+	g_warn_d2 = CheckDriveWarn(C_DRIVE_BUSID2,   g_warn_d2);
+	g_warn_d3 = CheckDriveWarn(C_DRIVE_BUSID3,   g_warn_d3);
+	g_warn_d4 = CheckDriveWarn(C_DRIVE_BUSID_1T, g_warn_d4);
+#endif
+}
+
+#endif // _3R1T_FAULTS_MH_

@@ -1,0 +1,535 @@
+//=========================================================================
+// 3R1T_Globals.mh
+//
+// Every global variable on the rig, and the small helpers that do nothing
+// but shuffle bits: CAN byte unpacking, the status LED, the message log.
+//
+// Nothing in here knows anything about the machine sequence. If a routine
+// makes a decision about what the rig should do next, it belongs in
+// QUB_3R1T.mc, not here.
+//
+// Include order matters:  3R1T_Config.mh  ->  this file  ->  the kinematics
+//=========================================================================
+
+#ifndef _3R1T_GLOBALS_MH_
+#define _3R1T_GLOBALS_MH_
+
+
+///////////////////////////////////////////////////////////////////////////
+// Kinematics interface
+//
+// These are the variables the two kinematics files read and write. They
+// are declared here, before the kinematics is included, so both files can
+// see them and neither has to declare anything of its own.
+//
+//   in:  psi_deg, phi_deg, User_theta_n_deg, User_tool_mm
+//   out: final_theta_1/2/3 [rad, multi-turn], final_tool_uu [0.01 mm]
+///////////////////////////////////////////////////////////////////////////
+double psi_deg          = 0;	// rotation about base X  [deg]
+double phi_deg          = 0;	// rotation about base Y  [deg]
+double User_theta_n_deg = 0;	// rotation about the platform normal [deg]
+double User_tool_mm     = 0;	// tool position along the stage [mm]
+
+// The pose's sines and cosines, computed ONCE per cycle by UpdatePoseTrig
+// and shared by both solvers.
+//
+// The 3R solver needs these three angles dozens of times per cycle and the
+// 1T solver wants the same six values, so they are worked out once. That
+// matters in a 2 ms interrupt that also carries a quadratic solve and a
+// square root.
+//
+// >>> ANYTHING READING THESE MUST USE THE SAME ANGLES. <<<
+// They are built from psi_deg / phi_deg / User_theta_n_deg as they stand
+// at the top of the cycle, with the 65.53 offset ALREADY folded into
+// User_theta_n_deg by the ISR. A solver that quietly applies its own
+// offset would be using trig that no longer matches its own angle.
+double g_cps = 1, g_sps = 0;	// cos/sin psi
+double g_cph = 1, g_sph = 0;	// cos/sin phi
+double g_cth = 1, g_sth = 0;	// cos/sin theta_n
+
+double final_theta_1 = 0;		// arm 1 motor angle [rad], multi-turn
+double final_theta_2 = 0;
+double final_theta_3 = 0;
+// The COMPLETE stage setpoint in axis user units - both lengths already
+// summed, exactly as the notebook sums them.
+//
+// Symmetric with final_theta_1/2/3: each solver takes the pose and hands
+// back a finished axis setpoint, and the ISR only applies the unit factor
+// and streams it. Nothing downstream adds anything to either.
+double final_tool_uu = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// Streaming
+//
+// The ISR always computes a setpoint and always writes REG_USERREFPOS.
+// Whether the drives are LISTENING to that register is decided by
+// AxisControl(..., USERREFPOS), and g_ik_armed says whether that has
+// happened.
+//
+// While NOT armed, the offsets below are re-pinned every cycle to wherever
+// the axes actually are. That means the register always holds "stay
+// exactly where you are", so the instant the mode switch happens there is
+// nothing to jump to. AxisControl(USERREFPOS) moves the motor to the
+// register value IMMEDIATELY, with no ramp - this is the one mechanism
+// that stops that being a fault.
+///////////////////////////////////////////////////////////////////////////
+long g_ik_armed = 0;			// 1 = drives are following the stream
+
+double g_off1 = 0;				// arm axis position at the home pose [cdeg]
+double g_off2 = 0;
+double g_off3 = 0;
+double g_offT = 0;				// tool axis position at the datum [0.01 mm]
+
+double factor_UU_QC    = FACTOR_UU_QC;
+double factor_1T_UU_QC = FACTOR_1T_UU_QC;
+
+long g_isr_t0 = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// CAN receivers
+///////////////////////////////////////////////////////////////////////////
+long canObjTheta = -1, canObjPlat = -1, canObjTrans = -1, canObjRef = -1;
+long canLastRxTheta = 0, canLastRxPlat = 0, canLastRxEnc = 0;
+long g_frames = 0;				// theta frames received, for the averager
+
+
+///////////////////////////////////////////////////////////////////////////
+// Homing
+///////////////////////////////////////////////////////////////////////////
+long g_sum1 = 0, g_sum2 = 0, g_sum3 = 0, g_count = 0;
+long g_lastFrame = 0;
+long g_tgt1 = 0, g_tgt2 = 0, g_tgt3 = 0;
+long g_move_t0 = 0;
+long g_pass = 0;				// 3R measure->move pass number
+
+// Largest remaining limb error from the previous pass [cdeg]. The homing
+// loop diverges rather than converges if HOME_DIR has the wrong sign, so
+// every pass has to prove it did better than the last one. Seeded huge so
+// the first pass always passes the test.
+long g_err_prev = 999999;
+
+// Total travel each arm has been commanded during this homing run [cdeg].
+// Bounded by HOME_MAX_TOTAL_CDEG - the guard that stops a sequence of
+// individually-reasonable passes adding up to a runaway.
+long g_moved1 = 0, g_moved2 = 0, g_moved3 = 0;
+
+long g_zero_um = 0;				// stage datum, in ESP32 encoder microns
+
+long g_h_dir     = C_1T_HOME_DIR;
+long g_h_t0      = 0;
+long g_h_moveT0  = 0;
+long g_h_stallT0 = 0;
+long g_h_rise0   = 0;			// REF edge values latched when this leg began
+long g_h_fall0   = 0;
+long g_h_passes0 = 0;
+long g_h_stops   = 0;			// end stops hit so far
+long g_h_backT0  = 0;
+long g_h_backPos = 0;
+
+// How a homing child tells its parent it is finished.
+//
+// SmTrans only reaches siblings and children, so a nested homing state
+// cannot name NotHomed or Ready - they are siblings of its PARENT. The
+// child sets one of these and returns SmNotHandled; the Homing state
+// itself, which can see both, does the transition in the same idle pass.
+long g_home_failed = 0;		// gave up - go back to NotHomed
+long g_home_done   = 0;		// datum captured - go to Ready
+
+
+///////////////////////////////////////////////////////////////////////////
+// Terminal chatter
+//
+// FALSE keeps the IDE output pane for things that need reading: failures,
+// refusals, the homing error line, and the datum. Everything routine is
+// gated on this, because a scrolling terminal hides the one line that
+// mattered.
+//
+// The panel message log is the running commentary. This is the trace you
+// turn on when the commentary is not enough.
+///////////////////////////////////////////////////////////////////////////
+long g_verbose = FALSE;
+
+// Prints the tool kinematics once a second: cable span, compensation, drum
+// and motor turns in both this axis's convention and the notebook's, and
+// what the encoder actually did. For bringing the cable model up or
+// checking it against the notebook - off in normal running.
+long g_tool_debug = FALSE;
+
+
+///////////////////////////////////////////////////////////////////////////
+// Warnings that should only be announced once each
+///////////////////////////////////////////////////////////////////////////
+long g_warned_stale   = 0;
+long g_warned_sing    = 0;
+long g_warned_surpass = 0;
+
+long g_errAxis = 0, g_errNo = 0, g_errInfo = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// The fault snapshot
+//
+// >>> WRITTEN ONCE, AT THE MOMENT OF THE FAULT, AND NOT TOUCHED AGAIN. <<<
+//
+// ErrorNo(), ErrorAxis() and ErrorInfo() report the LAST error, so every
+// command issued after the fault can overwrite them - including the
+// AxisControl(OFF) the fault state does on its way in. These are latched
+// by CaptureFault() from inside SIG_ERROR, before anything else runs, and
+// they are what the report is built from.
+//
+// They mirror USR_FAULT_* so the same thing can be read over SDO after the
+// terminal has scrolled, which is the situation an intermittent fault
+// always leaves you in.
+///////////////////////////////////////////////////////////////////////////
+long g_fault_count = 0;			// faults since power-up
+long g_fault_ms    = 0;			// Time() at the fault
+long g_fault_state = ST_UNKNOWN;	// what the rig was doing
+long g_fault_step  = 0;			// trajectory step, 0 if not running one
+long g_fault_psi   = 0;			// the commanded pose as it stood [cdeg]
+long g_fault_phi   = 0;
+long g_fault_thn   = 0;
+long g_fault_tool  = 0;			// [0.01 mm]
+
+// The profile that was ACTUALLY IN FORCE when it faulted.
+//
+// >>> READING USER_PARAM IN THE REPORT IS TOO LATE. <<<
+// TrajRun's SIG_EXIT runs before Fault's SIG_ENTRY, and SIG_EXIT puts the
+// panel's speeds back - so a report that reads the live slots prints the
+// panel profile and not the file's, which is a straight lie about what the
+// run was doing. Latched in SIG_ERROR with everything else.
+long g_fault_rot_vel  = 0;
+long g_fault_rot_acc  = 0;
+long g_fault_tool_vel = 0;
+long g_fault_tool_acc = 0;
+
+// Where the rig is now, as an ST_* value. Set by every state's SIG_ENTRY,
+// read only by CaptureFault(). A fault that always lands in the same state
+// is a different problem from one scattered across all of them.
+long g_state_id = ST_UNKNOWN;
+
+// >>> STOPS A FAULT INSIDE THE FAULT HANDLER LOOPING FOR EVER. <<<
+// SIG_ERROR transitions to Fault, and Fault's SIG_ENTRY turns drives off
+// and talks to them over CAN - either of which can fail if the bus is the
+// problem. Without this the second fault would transition to Fault again,
+// re-run SIG_ENTRY, and fault again.
+long g_in_fault = FALSE;
+
+// Last warning flags seen on each drive, so the health poll announces a
+// change rather than repeating itself once a second for ever.
+//
+// >>> FOUR SCALARS, NOT A dim ARRAY. <<<
+// dim arrays are exposed over SDO as 0x2100, 0x2101 ... IN THE ORDER THEY
+// APPEAR, and the trajectory .zbc files address GeneralData and
+// MoveSequenceData by that position. A dim declared above them here would
+// silently redirect every trajectory download into the wrong array, with
+// no error reported anywhere. See the note on those two below.
+long g_warn_d1 = 0;
+long g_warn_d2 = 0;
+long g_warn_d3 = 0;
+long g_warn_d4 = 0;
+
+// >>> WHAT EACH DRIVE WAS COMPLAINING OF AT POWER-UP, BEFORE IT WAS
+//     CLEARED. <<<
+//
+// CheckOneDrive finds a faulted drive at start-up and clears it so the rig
+// can be used - which means that by the time anything else looks, 0x603F
+// reads 0x0000 and the reason is gone. These keep it. A start-up fault
+// report with four zeros and no explanation is what these exist to stop.
+long g_boot_err1 = 0;
+long g_boot_err2 = 0;
+long g_boot_err3 = 0;
+long g_boot_err4 = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// Move planning
+//
+// The stage does not just track the tool box: it also pays out whatever
+// the platform tilt swallows, and that term is the larger of the two - so
+// a move is looked at along its whole path before it starts.
+//
+// ScanPosePath fills these in; PoseCommandOk and StartPoseMove read them.
+///////////////////////////////////////////////////////////////////////////
+double g_path_cable_min = 0;	// least cable the path ever needs   [mm]
+double g_path_cable_max = 0;	// most it ever needs                [mm]
+double g_path_seg_max   = 0;	// biggest step between two samples  [mm]
+
+
+///////////////////////////////////////////////////////////////////////////
+// Trajectory playback
+//
+// The panel's LOAD button downloads a file straight into these arrays, so
+// nothing here allocates or parses - the program only reads rows out.
+//
+//   GeneralData        the file header: length, sequence number
+//   MoveSequenceData   one row per waypoint, see SECTION 7b in Config
+///////////////////////////////////////////////////////////////////////////
+// >>> DECLARATION ORDER IS THE SDO INDEX. <<<
+// dim arrays are exposed as 0x2100, 0x2101, 0x2102 ... in the order they
+// appear, and the .zbc addresses them by that position - "arraybegin 0"
+// lands in the first, "arraybegin 1" in the second. Insert one above these
+// and the download goes into the wrong place with no error anywhere.
+dim long  GeneralData[20];							// 0x2100  array 0
+dim long  MoveSequenceData[C_SEQUENCE_SIZE][9];		// 0x2101  array 1
+
+long g_traj_row     = 0;	// next row to read, 0-based
+long g_traj_mode    = TRJ_IDLE;
+long g_traj_last    = 0;	// the final waypoint is running, let it finish
+
+// Edge detector for the blend. The next waypoint is loaded the moment the
+// profile generator starts DECELERATING towards the current one, which is
+// what makes the path flow through the points instead of stopping at each.
+// Without the edge, every idle pass during that deceleration would load
+// another row.
+long g_traj_pending = 0;
+
+// Last sequence number seen, so a newly downloaded file announces itself
+// once instead of every second.
+long g_traj_num_seen = 0;
+
+// >>> THE ROW SAYS WHETHER TO PAUSE. NOTHING HERE WORKS IT OUT. <<<
+//
+// LoadNextTrajPoint copies the loaded row's TRAJ_PAUSE column straight
+// into g_traj_pause_req, so this flag always describes the waypoint that
+// is running right now and there is no arithmetic on the rows anywhere.
+// A file that asks for no pauses gets none.
+//
+// >>> A PAUSE IS TWO STAGES AND THEY ARE NOT THE SAME THING. <<<
+//
+// First the run waits for a genuine standstill - bounded by
+// C_TRAJ_SETTLE_MS, because a wait on an axis is never allowed to be
+// indefinite. Only once that is satisfied does it hold, for the fixed
+// C_TRAJ_PAUSE_MS. g_traj_pausing says which of the two stages is
+// running, and it is what stops the settle test being re-entered once the
+// hold is under way.
+//
+// >>> g_traj_pause_t0 IS STAMPED WHEN THE AXES STOP, NOT WHEN THE ROW WAS
+//     LOADED. <<<
+//
+// That is the whole reason it exists rather than the hold reusing
+// g_traj_load_t0 below. g_traj_load_t0 is stamped at the top of
+// LoadNextTrajPoint, before the move has even been issued, so a hold
+// measured from it would be mostly travel time and would expire before
+// the rig had come to rest at all - a pause that paused for nothing.
+long g_traj_pause_req = FALSE;
+long g_traj_pausing   = FALSE;
+long g_traj_pause_t0  = 0;
+
+// When the running waypoint was loaded. Bounds the wait for it to come to
+// rest, so a pause cannot become an indefinite hold in front of an axis
+// that never reports standstill - see C_TRAJ_SETTLE_MS.
+long g_traj_load_t0 = 0;
+
+// The panel's own speeds, put aside while a file that carries its own is
+// running. A trajectory is allowed to pick its profile; it is not allowed
+// to leave the next MOVE running at it.
+//
+// g_traj_speeds_saved guards the restore rather than the save: SIG_EXIT
+// runs on every way out of TrajRun, including the ones that never got as
+// far as saving anything.
+long g_traj_speeds_saved = FALSE;
+long g_traj_sv_rot_vel   = 0;
+long g_traj_sv_rot_acc   = 0;
+long g_traj_sv_tool_vel  = 0;
+long g_traj_sv_tool_acc  = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// Prototypes
+///////////////////////////////////////////////////////////////////////////
+void UpdatePoseTrig(void);
+void PrintToolDebug(void);
+void PeriodRoutine(void);
+void InverseKinematicsSPM(void);
+void InverseKinematics1T(void);
+void InitToolKinematics(void);
+double CableSpan(double psi_d, double phi_d, double theta_n_d);
+long SetVelAccDec(long axe, long vel_uu, long acc_uu, long dec_uu);
+void DoSettingsUserUnits(long axis_no);
+
+
+///////////////////////////////////////////////////////////////////////////
+// Refresh the shared pose trig. Called once at the top of every ISR
+// cycle, before either solver runs.
+///////////////////////////////////////////////////////////////////////////
+void UpdatePoseTrig(void)
+{
+	double ps, ph, th;
+
+	ps = rad(psi_deg);
+	ph = rad(phi_deg);
+	th = rad(User_theta_n_deg);
+
+	g_cps = cos(ps);  g_sps = sin(ps);
+	g_cph = cos(ph);  g_sph = sin(ph);
+	g_cth = cos(th);  g_sth = sin(th);
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// CAN byte unpacking
+//
+// CanIn hands back two 32-bit words, bytes 0-3 and 4-7, MSB first within
+// each word. Everything the sensor node sends is little-endian, so these
+// put it back together.
+///////////////////////////////////////////////////////////////////////////
+long CanBusByte(long b03, long b47, long off)
+{
+	if (off < 4) {
+		return((b03 >> (8 * (3 - off))) & 0xFF);
+	}
+	return((b47 >> (8 * (7 - off))) & 0xFF);
+}
+
+long CanU16(long b03, long b47, long off)
+{
+	return(CanBusByte(b03, b47, off) | (CanBusByte(b03, b47, off + 1) << 8));
+}
+
+long CanI16(long b03, long b47, long off)
+{
+	long v;
+	v = CanU16(b03, b47, off);
+	if (v > 32767) { v = v - 65536; }
+	return(v);
+}
+
+long CanI32(long b03, long b47, long off)
+{
+	return(CanBusByte(b03, b47, off)
+	     | (CanBusByte(b03, b47, off + 1) << 8)
+	     | (CanBusByte(b03, b47, off + 2) << 16)
+	     | (CanBusByte(b03, b47, off + 3) << 24));
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Wrap a centidegree difference to -180.00 .. +180.00, so a limb always
+// takes the short way round to its home angle.
+///////////////////////////////////////////////////////////////////////////
+long WrapCDeg(long d)
+{
+	while (d >  18000) { d = d - 36000; }
+	while (d < -18000) { d = d + 36000; }
+	return(d);
+}
+
+long AbsL(long v)
+{
+	if (v < 0) { return(-v); }
+	return(v);
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Status LED - exactly one colour at a time.
+//
+//   green  good, homed, will accept MOVE
+//   amber  working, or not ready yet
+//   red    error
+///////////////////////////////////////////////////////////////////////////
+void SetLed(long colour)
+{
+	USER_PARAM(USR_LED) = colour;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Status message - the running commentary.
+//
+// One line in the terminal per event, prefixed ">>" so it stands out
+// among the diagnostics. It lives here rather than on the panel because
+// the panel file's Table element will not parse with strings of any useful
+// length, and because keeping the wording in one file means it cannot
+// drift out of step with anything.
+//
+// Repeats are swallowed. Say() is called from SIG_IDLE handlers that run
+// continuously, so without that the terminal would fill with the same
+// line hundreds of times a second - which is exactly the noise this
+// build is trying to keep out of the IDE.
+//
+// USR_MSG still carries the code, so the last event is readable over SDO
+// even though no panel element shows it.
+///////////////////////////////////////////////////////////////////////////
+void Say(long msg)
+{
+	if (USER_PARAM(USR_MSG) == msg) { return; }
+	USER_PARAM(USR_MSG) = msg;
+
+	switch (msg) {
+		case MSG_BOOT:          print(">> Starting up"); break;
+		case MSG_CFG_DRIVES:    print(">> Configuring drives"); break;
+		case MSG_PWR_ON:        print(">> Powering up all four drives"); break;
+		case MSG_DRV_OK:        print(">> All drives enabled"); break;
+		case MSG_DRV_FAIL:      print(">> DRIVE NOT ENABLED - check supply and wiring"); break;
+		case MSG_SIM:           print(">> SIM MODE - the motors will not power up"); break;
+		case MSG_NEED_HOME:     print(">> Not homed - press HOME"); break;
+
+		case MSG_HOME_START:    print(">> HOMING: started"); break;
+		case MSG_HOME_NO_IMU:   print(">> HOMING refused: no limb angles on CAN"); break;
+		case MSG_HOME_NO_ENC:   print(">> HOMING refused: no encoder data on CAN"); break;
+		case MSG_HOME_MEAS:     print(">> HOMING: measuring limb angles"); break;
+		case MSG_HOME_MOVE:     print(">> HOMING: moving limbs towards 0 / 240 / 120"); break;
+		case MSG_HOME_PASS:     print(">> HOMING: pass done, measuring again"); break;
+		case MSG_HOME_LIMBS_OK: print(">> HOMING: limbs are at the home angles"); break;
+		case MSG_HOME_NO_CONV:  print(">> HOMING failed: limbs not converging"); break;
+		case MSG_HOME_DIVERGE:  print(">> HOMING STOPPED: error growing - check HOME_DIR"); break;
+		case MSG_HOME_FAR:      print(">> HOMING STOPPED: an arm travelled too far"); break;
+		case MSG_HOME_MV_TMO:   print(">> HOMING failed: limbs did not settle"); break;
+		case MSG_HOME_STALE:    print(">> HOMING failed: sensor CAN went stale"); break;
+		case MSG_HOME_1T_START: print(">> HOMING: searching for the stage REF mark"); break;
+		case MSG_HOME_1T_STOP:  print(">> HOMING: end stop reached, reversing"); break;
+		case MSG_HOME_1T_CLEAR: print(">> HOMING: clear of the end stop, searching again"); break;
+		case MSG_HOME_1T_FOUND: print(">> HOMING: REF mark found, stage datum set"); break;
+		case MSG_HOME_1T_FAIL:  print(">> HOMING failed: REF mark never seen"); break;
+		case MSG_HOME_1T_JAM:   print(">> HOMING failed: stage jammed on the end stop"); break;
+		case MSG_HOME_1T_TMO:   print(">> HOMING failed: stage timed out"); break;
+		case MSG_HOME_1T_SKIP:  print(">> HOMING: stage homing disabled, skipped"); break;
+		case MSG_HOME_ALIGN:    print(">> HOMING: capturing datum, aligning kinematics"); break;
+		case MSG_HOME_DONE:     print(">> HOMED - ready to move"); break;
+		case MSG_HOME_ABORT:    print(">> HOMING: aborted"); break;
+
+		case MSG_MOVE_CMD:      print(">> MOVE: command accepted"); break;
+		case MSG_MOVE_RUN:      print(">> MOVE: running"); break;
+		case MSG_MOVE_DONE:     print(">> MOVE: complete"); break;
+		case MSG_MOVE_NO_HOME:  print(">> MOVE refused: press HOME first"); break;
+		case MSG_MOVE_PSI_LIM:  print(">> MOVE refused: psi outside the workspace"); break;
+		case MSG_MOVE_PHI_LIM:  print(">> MOVE refused: phi outside the workspace"); break;
+		case MSG_MOVE_THN_LIM:  print(">> MOVE refused: theta_n outside travel"); break;
+		case MSG_MOVE_TOOL_LIM: print(">> MOVE refused: tool outside travel"); break;
+
+		case MSG_TRAJ_SINGLE:   print(">> TRAJECTORY: running once"); break;
+		case MSG_TRAJ_CONT:     print(">> TRAJECTORY: running continuously"); break;
+		case MSG_TRAJ_DONE:     print(">> TRAJECTORY: complete"); break;
+		case MSG_TRAJ_STOP:     print(">> TRAJECTORY: stopped"); break;
+		case MSG_TRAJ_EMPTY:    print(">> TRAJECTORY refused: nothing loaded"); break;
+		case MSG_TRAJ_LIM:      print(">> TRAJECTORY stopped: a point is out of limits"); break;
+		case MSG_MOVE_SLOWED:   print(">> MOVE: slowed to keep the stage within its limit"); break;
+
+		case MSG_STOP:          print(">> STOPPED"); break;
+		case MSG_ERROR:         print(">> ERROR - drives off. Press HOME to clear and re-home."); break;
+		case MSG_ERR_CLR:       print(">> Error cleared"); break;
+		case MSG_WARN_STALE:    print(">> WARNING: sensor data has gone stale"); break;
+		case MSG_WARN_SING:     print(">> WARNING: IK singular, pose held"); break;
+		case MSG_WARN_SURPASS:  print(">> WARNING: leg lap risk, legs over a turn apart"); break;
+		case MSG_CAN_RESET:     print(">> CAN receivers re-armed"); break;
+	}
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// USR_STATE bit helpers, so the state machine reads as prose.
+///////////////////////////////////////////////////////////////////////////
+void StaSet(long bits)
+{
+	USER_PARAM(USR_STATE) = USER_PARAM(USR_STATE) | bits;
+}
+
+void StaClr(long bits)
+{
+	USER_PARAM(USR_STATE) = USER_PARAM(USR_STATE) & ~bits;
+}
+
+#endif // _3R1T_GLOBALS_MH_

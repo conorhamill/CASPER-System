@@ -1,0 +1,258 @@
+[VARIABLES]
+
+///////////////////////////////////////////////////////////////////////
+//
+//  3R1T trajectory panel   (use with QUB_3R1T_Traj.mc)
+//
+//  Everything powers up on its own. There are no power buttons.
+//
+//  1. Wait for READY.
+//
+//         READY   homed and standing still. It will accept MOVE.
+//         BUSY    working, or not ready yet.
+//         ERROR   drives are off. Press HOME to clear it and re-home.
+//
+//  2. Press HOME. One press does the whole sequence: limbs, then stage,
+//     then the datum.
+//
+//  3. Type psi, phi, theta_n and tool, then press MOVE. Each box writes
+//     as you leave it, and stays put afterwards - so pressing MOVE again
+//     repeats the same move. HOME puts all four back to zero.
+//
+//  4. To run a path: LOAD a .zbc file, then SINGLE or CONTINUOUS.
+//     The path flows THROUGH the waypoints without stopping at them, so
+//     it comes out as one continuous movement rather than a series of
+//     separate moves. STOP ends it wherever it is.
+//
+//  HOME always brings it back, from anywhere, including out of an error.
+//  STOP holds the pose where it is.
+//
+//  The running commentary is in the IDE terminal - one line per event.
+//  It is not repeated here.
+//
+//
+//  NO Table OR Message ELEMENTS IN THIS FILE - ON PURPOSE.
+//
+//  The Table element would not parse with strings of any useful length,
+//  so anything wordy lives in the terminal and the panel sticks to lamps,
+//  numbers and fixed text. Those are the elements the shipped panels
+//  have always used, and they never need this file and the program to
+//  agree about wording.
+//
+//
+//  Value flags used here:
+//    0x0201  display dialog, read-only     - the sensor readouts
+//    0x0204  display dialog, auto-write    - the four command boxes
+//  0x0200 is what removes the Read and Write buttons. If a command box
+//  will not accept typing, change its 0x0204 to 0x0104 (small dialog,
+//  auto-write) - that keeps the buttons but is known to be editable.
+//
+///////////////////////////////////////////////////////////////////////
+
+WindowWidth  = 560
+WindowHeight = 600
+WindowFlags  = 0x0000
+WindowTitle  = QUB 3R1T - trajectory
+
+PollInterval = 200
+OpFlags      = 0x0001
+
+
+$MACS_MASTER = Controller,0x0000,1,(1,USB,6,50,0x0,921600,1)
+
+
+#define SCALE_CDEG   100    // centidegrees -> degrees
+#define SCALE_MM100  100    // 0.01 mm      -> mm
+#define SCALE_UM    1000    // microns      -> mm
+
+
+///////////////////////////////////////////////////////////////////////
+//  SDO definitions
+//
+//  Object 0x2201, subindex = the USER_PARAM slot in 3R1T_Config.mh.
+//
+//  The four command boxes ARE polled (0x0001), so they show zero at
+//  startup and go back to zero when HOME is pressed - the program writes
+//  those slots and the panel has to read them back to notice.
+//
+//  The cost is that a poll can land while you are mid-edit in a box. If
+//  that turns out to be a nuisance, change these four back to 0x0000 and
+//  accept that the boxes then keep whatever you last typed.
+///////////////////////////////////////////////////////////////////////
+$SDO_Cmd     = SDO,0x0000,MACS_MASTER,0x2201, 1,0,0
+$SDO_Led     = SDO,0x0001,MACS_MASTER,0x2201, 3,0,0
+
+$SDO_TgtPsi  = SDO,0x0001,MACS_MASTER,0x2201,10,0,0
+$SDO_TgtPhi  = SDO,0x0001,MACS_MASTER,0x2201,11,0,0
+$SDO_TgtThN  = SDO,0x0001,MACS_MASTER,0x2201,12,0,0
+$SDO_TgtTool = SDO,0x0001,MACS_MASTER,0x2201,13,0,0
+
+$SDO_Th1     = SDO,0x0001,MACS_MASTER,0x2201,20,0,0
+$SDO_Th2     = SDO,0x0001,MACS_MASTER,0x2201,21,0,0
+$SDO_Th3     = SDO,0x0001,MACS_MASTER,0x2201,22,0,0
+$SDO_ImuSt   = SDO,0x0001,MACS_MASTER,0x2201,23,0,0
+
+$SDO_PlatX   = SDO,0x0001,MACS_MASTER,0x2201,25,0,0
+$SDO_PlatY   = SDO,0x0001,MACS_MASTER,0x2201,26,0,0
+$SDO_PlatZ   = SDO,0x0001,MACS_MASTER,0x2201,27,0,0
+$SDO_PlatSt  = SDO,0x0001,MACS_MASTER,0x2201,28,0,0
+
+$SDO_Enc     = SDO,0x0001,MACS_MASTER,0x2201,30,0,0
+
+$SDO_State   = SDO,0x0001,MACS_MASTER,0x2201, 2,0,0
+
+//  Slot 60 is USR_MOVE_VEL, the pose move speed, in CENTIDEGREES per
+//  second. Shown through SCALE_CDEG so the box reads and writes DEGREES
+//  per second - nothing in the program converts anything, the panel does
+//  it, exactly as it does for the four command boxes above.
+//
+//  POLLED (0x0001) on purpose: the box then always shows what the speed
+//  actually is, which is the question you cannot otherwise answer without
+//  an SDO tool. A trajectory carrying its own speed will make this box
+//  change while it runs, and change back when it ends - that is the
+//  program swapping the file's speed in and out, not a fault.
+$SDO_MoveVel = SDO,0x0001,MACS_MASTER,0x2201,60,0,0
+
+
+///////////////////////////////////////////////////////////////////////
+//  STATUS
+//
+//  Exactly one lamp is lit. Slot 3 is a bit field, not a number:
+//  bit0 green, bit1 amber, bit2 red.
+///////////////////////////////////////////////////////////////////////
+$Box_St = Box,"*Status",0,15,10,520,62,0x0000
+
+$Lamp_G = Bit,Box_St, 30,20,28,28,0x0000,Green, Gray,DlgGray,SDO_Led,0x01
+$Txt_G  = Text,"READY", Lamp_G,36,8,70,16,-1,15,0x0001
+
+$Lamp_A = Bit,Box_St,200,20,28,28,0x0000,Yellow,Gray,DlgGray,SDO_Led,0x02
+$Txt_A  = Text,"BUSY",  Lamp_A,36,8,70,16,-1,15,0x0001
+
+$Lamp_R = Bit,Box_St,370,20,28,28,0x0000,Red,   Gray,DlgGray,SDO_Led,0x04
+$Txt_R  = Text,"ERROR", Lamp_R,36,8,70,16,-1,15,0x0001
+
+
+///////////////////////////////////////////////////////////////////////
+//  COMMAND
+//
+//  psi / phi / theta_n in degrees, tool in mm. Type, tab out, press MOVE.
+//
+//  Speed sits top right, in degrees per second, and is NOT part of a move:
+//  it is whatever the next move or trajectory will run at. A file that
+//  carries its own speed overrides it for the length of that run.
+//
+//  HOME also clears an error - there is no separate clear button, since
+//  anything worth clearing needs re-homing afterwards anyway.
+///////////////////////////////////////////////////////////////////////
+$Box_Cmd = Box,"*Command",0,15,82,520,196,0x0000
+
+// Labels are separate Text elements, not the Value's own label: the
+// display dialog (0x0200) does not draw one. Same pattern as the sensor
+// rows below, which is the one proven in the shipped panels.
+$Txt_Psi  = Text,"psi [deg]:",     Box_Cmd,15, 24,95,16,-1,15,0x0000
+$Val_Psi  = Value,"*", Box_Cmd,115, 22,0x0204,SDO_TgtPsi, 0,0,SCALE_CDEG
+
+$Txt_Phi  = Text,"phi [deg]:",     Box_Cmd,15, 54,95,16,-1,15,0x0000
+$Val_Phi  = Value,"*", Box_Cmd,115, 52,0x0204,SDO_TgtPhi, 0,0,SCALE_CDEG
+
+$Txt_ThN  = Text,"theta_n [deg]:", Box_Cmd,15, 84,95,16,-1,15,0x0000
+$Val_ThN  = Value,"*", Box_Cmd,115, 82,0x0204,SDO_TgtThN, 0,0,SCALE_CDEG
+
+$Txt_Tool = Text,"tool [mm]:",     Box_Cmd,15,114,95,16,-1,15,0x0000
+$Val_Tool = Value,"*", Box_Cmd,115,112,0x0204,SDO_TgtTool,0,0,SCALE_MM100
+
+// >>> SPEED, TOP RIGHT. IT IS NOT PART OF A MOVE COMMAND. <<<
+//
+//  Typing here writes USR_MOVE_VEL straight away - there is no button to
+//  press afterwards, the same as the four boxes to the left. Nothing moves
+//  until MOVE or a trajectory runs; this only decides how fast it will be
+//  when it does.
+//
+//  >>> THE BOX WRITES BY ITSELF. THERE IS NOTHING TO PRESS. <<<
+//
+//  Typing a speed here and tabbing out writes USR_MOVE_VEL immediately, the
+//  same as the four command boxes to the left. Nothing moves as a result -
+//  this only sets how fast the next MOVE or trajectory will be when it runs.
+//
+//  There is deliberately no button beside it. Button,Set sends a CONSTANT
+//  and no panel action commits an edit field, so a button could only ever
+//  write one fixed speed - which is not what the box is for.
+$Txt_Vel  = Text,"speed [deg/s]:", Box_Cmd,300, 24,100,16,-1,15,0x0000
+$Val_Vel  = Value,"*", Box_Cmd,405, 22,0x0204,SDO_MoveVel,0,0,SCALE_CDEG
+
+$Btn_Move = Button,Set,"*MOVE", Box_Cmd, 15,150,150,34,0x0000, Green, DlgGray, SDO_Cmd, 0x01, 0
+$Btn_Home = Button,Set,"*HOME", Box_Cmd,180,150,150,34,0x0000, Blue,  DlgGray, SDO_Cmd, 0x08, 0
+$Btn_Stop = Button,Set,"*STOP", Box_Cmd,345,150,120,34,0x0000, Red,   DlgGray, SDO_Cmd, 0x02, 0
+
+
+///////////////////////////////////////////////////////////////////////
+//  SENSORS
+//
+//  Straight off CAN2, nothing derived. The joint angles are what the
+//  limb IMUs report, not what the motor encoders think - which is the
+//  point of them, and what homing measures against.
+///////////////////////////////////////////////////////////////////////
+$Box_Sen = Box,"*Sensors",0,15,288,520,160,0x0000
+
+$Txt_J1  = Text,"joint angle 1 [deg]:", Box_Sen,15, 24,120,16,-1,15,0x0000
+$Val_J1  = Value,"*", Box_Sen,145, 22,0x0201,SDO_Th1,0,0,SCALE_CDEG
+$Lamp_I1 = Bit,Box_Sen,290,22,18,18,0x0000,Green,Gray,DlgGray,SDO_ImuSt,0x01
+$Txt_I1  = Text,"IMU", Lamp_I1,22,2,34,16,-1,15,0x0000
+
+$Txt_J2  = Text,"joint angle 2 [deg]:", Box_Sen,15, 50,120,16,-1,15,0x0000
+$Val_J2  = Value,"*", Box_Sen,145, 48,0x0201,SDO_Th2,0,0,SCALE_CDEG
+$Lamp_I2 = Bit,Box_Sen,290,48,18,18,0x0000,Green,Gray,DlgGray,SDO_ImuSt,0x02
+$Txt_I2  = Text,"IMU", Lamp_I2,22,2,34,16,-1,15,0x0000
+
+$Txt_J3  = Text,"joint angle 3 [deg]:", Box_Sen,15, 76,120,16,-1,15,0x0000
+$Val_J3  = Value,"*", Box_Sen,145, 74,0x0201,SDO_Th3,0,0,SCALE_CDEG
+$Lamp_I3 = Bit,Box_Sen,290,74,18,18,0x0000,Green,Gray,DlgGray,SDO_ImuSt,0x04
+$Txt_I3  = Text,"IMU", Lamp_I3,22,2,34,16,-1,15,0x0000
+
+// The 4th IMU. XYZ intrinsic Euler: tilt about X, then Y, then spin
+// about the new Z.
+$Txt_Pl  = Text,"platform  X / Y / Z [deg]:", Box_Sen,15,106,150,16,-1,15,0x0000
+$Val_PX  = Value,"*", Box_Sen,170,104,0x0201,SDO_PlatX,0,0,SCALE_CDEG
+$Val_PY  = Value,"*", Box_Sen,285,104,0x0201,SDO_PlatY,0,0,SCALE_CDEG
+$Val_PZ  = Value,"*", Box_Sen,400,104,0x0201,SDO_PlatZ,0,0,SCALE_CDEG
+
+$Txt_En  = Text,"encoder pos [mm]:", Box_Sen,15,132,120,16,-1,15,0x0000
+$Val_En  = Value,"*", Box_Sen,145,130,0x0201,SDO_Enc,0,0,SCALE_UM
+$Lamp_Pl = Bit,Box_Sen,290,130,18,18,0x0000,Green,Gray,DlgGray,SDO_PlatSt,0x01
+$Txt_PlL = Text,"platform IMU", Lamp_Pl,22,2,90,16,-1,15,0x0000
+
+
+///////////////////////////////////////////////////////////////////////
+//  TRAJECTORY
+//
+//  LOAD opens a file picker and downloads the chosen .zbc straight into
+//  the sequence arrays. The path in the braces is only the starting
+//  folder the picker opens at - change it if the files live elsewhere.
+//
+//  SINGLE runs the file once and stops on the last point. CONTINUOUS
+//  repeats it until STOP; the generated files start and end at the same
+//  pose, so the wrap blends like any other waypoint.
+//
+//  Neither button does anything until the rig is READY - a trajectory is
+//  a series of MOVEs, so it needs a datum like any other move.
+//
+//  LOAD reports nothing back on the panel. The terminal prints one line
+//  when a file arrives - how many points it has and its number - and
+//  that is the confirmation it landed.
+//
+//  The lamp is lit while a trajectory is running.
+///////////////////////////////////////////////////////////////////////
+$Box_Trj = Box,"*Trajectory",0,15,452,520,130,0x0000
+
+// Flags MUST be 0x0100. That bit is the file picker, and the small arrow
+// control next to the button comes with it - they are one feature, not two.
+// At 0x0000 the button loses the arrow AND the chooser, and can then only
+// ever download the single path written in the braces below.
+$Btn_Load = Button,Download,"*LOAD FILE",Box_Trj,15,22,150,30,0x0100,-,Black,DlgGray,-,{MACS_MASTER,0x44000020,"C:\Users\40058766\CASPER\3R1T_trajectory\full_sweep.zbc"}
+
+$Btn_Sngl = Button,Set,"*SINGLE",     Box_Trj, 15,64,150,30,0x0000, Green, DlgGray, SDO_Cmd, 0x10, 0
+$Btn_Cont = Button,Set,"*CONTINUOUS", Box_Trj,175,64,150,30,0x0000, Blue,  DlgGray, SDO_Cmd, 0x20, 0
+$Btn_TStp = Button,Set,"*STOP",       Box_Trj,335,64,120,30,0x0000, Red,   DlgGray, SDO_Cmd, 0x02, 0
+
+$Lamp_Trj = Bit,Box_Trj,15,102,18,18,0x0000,Green,Gray,DlgGray,SDO_State,0x80
+$Txt_TrjR = Text,"running", Lamp_Trj,26,2,80,16,-1,15,0x0001

@@ -1,0 +1,383 @@
+//=========================================================================
+// 3R1T_Kin_1T.mh   -   the 1T kinematics.   COMPLETE.
+//
+// The tool is driven by a cable. The cable leaves a fixed outlet on the
+// BASE, crosses open space, and enters the PLATFORM at a fixed point on
+// it. Winding the drum in or out is the tool movement.
+//
+// So the platform cannot tilt without changing the length of that open
+// span - and any cable the span swallows is cable taken from the tool.
+// Holding the tool still while the platform moves is therefore not a
+// no-op: it is a continuous winding operation. That coupling is what this
+// file computes.
+//
+//   in    User_tool_mm       tool movement asked for   [mm]
+//         psi_deg            \  the commanded pose, already valid for
+//         phi_deg             > this cycle - the ISR runs the 3R solver
+//         User_theta_n_deg   /  first
+//
+//   out   final_tool_uu      the COMPLETE stage setpoint [0.01 mm].
+//                          Both lengths summed here, as the notebook does.
+//
+//
+// THE GEOMETRY
+//
+//   P_co_O   cable outlet, fixed in the BASE frame
+//   P_ci_n   cable inlet,  fixed in the PLATFORM frame
+//
+//   P_ci_O = R(psi, phi, theta_n) . P_ci_n        inlet, in base frame
+//   L      = | P_ci_O - P_co_O |                  the open span
+//
+//   carriage = tool command + (L(pose) - L(home)) x COMP_DIR / COMP_REEVING
+//
+// L is a CABLE length and the tool command is a CARRIAGE displacement, so
+// the span term is divided by the reeving before the two are added.
+//
+// R is Rx(psi).Ry(phi).Rz(theta_n) - the SAME convention as the 3R
+// solver, checked term by term against it rather than assumed. That is
+// why the pose can be handed straight over with no frame conversion.
+//
+//
+// >>> THE 65.53 OFFSET IS ALREADY IN User_theta_n_deg. <<<
+//
+// The ISR adds it before calling either solver. Do NOT add it again here.
+// The reference notebook applies it inside its own rotation_matrix(), so
+// porting that code across verbatim would count it twice and quietly tilt
+// every span by 65 degrees.
+//
+//
+// WHAT THE COUPLING COSTS, measured over the workspace
+//
+//   Pure roll at zero tilt is FREE. P_co_O sits on the base z axis, so at
+//   psi = phi = 0 the platform spins about that same axis and the inlet
+//   point just orbits at constant radius and height. The span cannot
+//   change. Infinite roll needs no cable at all.
+//
+//   Tilt is expensive, because the inlet point is 218 mm out from the
+//   centre of rotation and an arc that long moves 3.8 mm per degree:
+//
+//     tilt      cable span needed        roll cost at that tilt
+//     +/- 5     -12.0 .. +21.8 mm        27.8 mm per platform turn
+//     +/-10     -14.0 .. +46.9 mm        47.4 mm
+//     +/-20     -13.9 .. +98.7 mm        60.0 mm
+//     +/-30     -14.0 .. +147.9 mm       61.7 mm
+//
+//   So the stage's travel, not the 3R singularity at 32.8 deg, is what
+//   really bounds the usable workspace. The caller fences the TOTAL - see
+//   LIM_TOOL_MM100 and ScanPosePath in QUB_3R1T.mc.
+//
+//
+// >>> C_TOOL_UU_PER_MM IS NOT THE NUMBER TO TUNE. LEAVE IT AT 100. <<<
+//
+// The axis user unit is 0.01 mm by construction, so 100 UU per millimetre
+// is exact and contributes nothing. All of the scaling lives in the axis
+// setup in 3R1T_Config.mh:
+//
+//   motor -> 159:1 gearbox -> 55 mm DRIVEN drum -> cable -> 2:1 reeving
+//   one output revolution = pi x 55 / 2 = 86.39 mm of CARRIAGE travel
+//
+// carried by C_TOOL_TRAVEL_PER_REV_MM100. Only the DRIVEN drum sets cable
+// payout - the 28 mm idler contributes nothing to length. See the note in
+// 3R1T_Config.mh.
+//
+// CHECK IT AGAINST THE ENCODER. Use a DIFFERENCE of two positions, both
+// non-zero, so the homing coast and the cable slack cancel out:
+//
+//   1. HOME.
+//   2. tool = 20.00 mm, MOVE, write down "encoder pos".   e1
+//   3. tool = 60.00 mm, MOVE, write down "encoder pos".   e2
+//   4. C_TOOL_DRUM_DIA_MM100 = old value x (e2 - e1) / 40.00
+//
+// Do it at psi = phi = 0, so the tilt compensation is zero and the only
+// thing moving the stage is the number you typed. Go one way only and use
+// a long travel: there is roughly half a millimetre of slack in the cable,
+// which is 10% of a 5 mm move and under 2% of a 40 mm one.
+//
+//
+// WHERE TOOL ZERO IS, AND WHY NO CONSTANT HERE CAN MOVE IT
+//
+// Tool zero is wherever the stage came to rest at the end of homing - the
+// REF mark plus however far it coasted. The caller pins the axis offset at
+// that instant, so ANY constant term added to the output is captured
+// into the offset along with it and cancels exactly. The only thing that
+// moves tool zero is homing somewhere else.
+//
+// The tilt compensation escapes that only because it is zero at the home
+// pose by construction: L(home) is subtracted from it.
+//=========================================================================
+
+#ifndef _3R1T_KIN_1T_MH_
+#define _3R1T_KIN_1T_MH_
+
+
+///////////////////////////////////////////////////////////////////////////
+// Cable geometry.
+//
+// These live here rather than in Config because they are the solver's own
+// model of the rig, not machine setup - nothing outside this file has any
+// use for them. The drum stays in Config, because the axis scaling
+// genuinely needs it.
+//
+// Both points are in millimetres. Measure them off the CAD.
+///////////////////////////////////////////////////////////////////////////
+// P_co_O - cable outlet, fixed in the BASE frame.
+//
+// Its x and y being zero is not incidental: it puts the outlet on the
+// very axis the platform rolls about, which is exactly why pure roll
+// costs no cable. Move it off that axis and infinite roll starts winding
+// the drum back and forth once per turn.
+#define C_CABLE_OUT_X		0.0
+#define C_CABLE_OUT_Y		0.0
+#define C_CABLE_OUT_Z		(-252.0)
+
+// P_ci_n - cable inlet, fixed in the PLATFORM frame.
+#define C_CABLE_IN_X		(-20.0)
+#define C_CABLE_IN_Y		23.5
+#define C_CABLE_IN_Z		(-213.79)
+
+
+///////////////////////////////////////////////////////////////////////////
+// Which model to run.
+//
+//   KIN_1T_COUPLED       the cable model above                (default)
+//   KIN_1T_PASSTHROUGH   ignores the platform entirely - the tool command
+//                        goes straight to the stage. Kept as something to
+//                        fall back to, and to compare against when the
+//                        coupled model is the thing under suspicion.
+///////////////////////////////////////////////////////////////////////////
+#define KIN_1T_PASSTHROUGH	1
+#define KIN_1T_COUPLED		2
+
+// >>> WHICHEVER IS SET HERE, THE TERMINAL SAYS SO. <<<
+//
+// PASSTHROUGH sends the virtual axis straight to the drive and nothing
+// else happens - the right place to start when the AXIS itself is in
+// doubt. In that mode the trace prints "compensation 0.0000" and a span
+// identical to the home span, which looks exactly like a coupled model
+// that has failed, so the trace names the model to tell them apart.
+#define KIN_1T_MODEL		KIN_1T_COUPLED
+
+
+// Axis user units per millimetre of cable. Exact - see the header.
+#define C_TOOL_UU_PER_MM	100.0
+
+// >>> THE TILT COMPENSATION HAS ITS OWN SIGN, AND IT NEEDS ONE. <<<
+//
+// C_1T_POS_DIR in Config flips the whole output, so it moves the command
+// and the compensation together and cannot change one RELATIVE to the
+// other. Two independent facts about the rig decide those separately:
+//
+//   C_1T_POS_DIR      does a positive tool command advance the tool?
+//   C_TOOL_COMP_DIR   is the tilt correction the same sense as the tool
+//                     command, or the opposite?
+//
+// Get the second one wrong and the tool does not merely fail to hold
+// position - it moves about TWICE as far as it would with no compensation
+// at all, because the correction is applied backwards:
+//
+//   holds still            correct
+//   drifts by ~dL          compensation not being applied at all
+//   drifts by ~2 x dL      this sign is wrong
+//
+// -1 on this rig. The notebook gives the two terms the same sense, which
+// taken at face value would mean +1; the machine disagrees, and the cable
+// routing decides it, not the paper.
+//
+// >>> DO NOT SET THIS FROM AN ARGUMENT ABOUT WHICH WAY CABLE GOES. <<<
+// There is a test that settles it in a minute and needs no reasoning:
+//
+//   1. tool = 0, tilt to phi = +5 deg. Note which way the drum turns.
+//   2. phi = 0, tool = +15.79 mm     . Note which way the drum turns.
+//
+// Both ask this axis for the same 15.79 mm of travel. Same direction means
+// +1 is right; opposite means -1. Nothing about cable routing enters into
+// it, which is exactly why it is reliable.
+#define C_TOOL_COMP_DIR		(-1)
+
+// >>> THE TWO TERMS ARE NOT IN THE SAME UNIT. <<<
+//
+//   the tool command   is a CARRIAGE displacement - you type where you
+//                      want the carriage, and FEEDDIST is carriage travel
+//                      per output revolution, so it needs no conversion
+//
+//   the compensation   is a CABLE length - L is the distance between two
+//                      points in space, which is cable, not carriage
+//
+// The cable is reeved, so the carriage travels less than the cable does.
+// To absorb dL of cable at the span, the carriage moves dL divided by the
+// number of strands sharing that movement. Without this the compensation
+// is over-applied by exactly that factor.
+//
+// Measured on the rig: at phi = 5 deg the span changes by 15.79 mm and the
+// carriage must move 7.89 mm.
+//
+// It is the SAME 2:1 as C_TOOL_REEVING, seen from the other side, which is
+// why it is defined from it rather than written out again. The cable runs
+//
+//     drum -> carriage pulley -> outlet -> span -> inlet
+//
+// so the two strands at that pulley are the drum side and the span side.
+// Pull 2 mm from the drum and the carriage moves 1 mm; lengthen the span
+// by 2 mm and the carriage moves 1 mm. One pulley, both ratios.
+//
+// If they ever turn out to differ - a second pulley on only one side -
+// this is the line to break apart.
+#define C_TOOL_COMP_REEVING	C_TOOL_REEVING
+
+
+///////////////////////////////////////////////////////////////////////////
+// Working variables. Kept at file scope rather than as locals so they can
+// be watched from the terminal while the model is brought up - which is
+// the difference between diagnosing a wrong sign and guessing at one.
+///////////////////////////////////////////////////////////////////////////
+double tool_cmd_mm   = 0;		// what was asked for                [mm]
+double tool_corr_mm  = 0;		// what the tilt demands             [mm]
+double tool_total_mm = 0;		// what the stage will actually do   [mm]
+double cable_L       = 0;		// the open span right now           [mm]
+
+double g_L_home      = 0;		// the span at the home pose         [mm]
+long   g_L_home_ok   = 0;
+
+// Mirrors of the notebook's printouts, kept so the rig can be checked
+// against it directly rather than by inference.
+double tool_drum_turns  = 0;
+double tool_motor_turns = 0;
+
+// The same quantities in the NOTEBOOK's convention, so the two can be put
+// side by side without anyone having to negate anything in their head.
+double nb_total_cable_mm = 0;
+double nb_drum_turns     = 0;
+double nb_motor_turns    = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// The open span between outlet and inlet, for one pose.
+//
+// theta_n_d must ALREADY include the 65.53 home offset.
+//
+// This runs 500 times a second, so the rotation matrix is applied inline
+// to the one vector that needs it rather than being built and stored.
+///////////////////////////////////////////////////////////////////////////
+double CableSpan(double psi_d, double phi_d, double theta_n_d)
+{
+	double ps, ph, th;
+	double cps, sps, cph, sph, cth, sth;
+	double x, y, z, dx, dy, dz;
+
+	// The LIVE pose gets the shared trig UpdatePoseTrig already computed.
+	// Any other pose - the path scan asks about poses the rig is not at -
+	// has to work them out for itself.
+	if (psi_d == psi_deg && phi_d == phi_deg && theta_n_d == User_theta_n_deg) {
+		cps = g_cps;  sps = g_sps;
+		cph = g_cph;  sph = g_sph;
+		cth = g_cth;  sth = g_sth;
+	} else {
+		ps = rad(psi_d);
+		ph = rad(phi_d);
+		th = rad(theta_n_d);
+		cps = cos(ps);  sps = sin(ps);
+		cph = cos(ph);  sph = sin(ph);
+		cth = cos(th);  sth = sin(th);
+	}
+
+	// P_ci_O = Rx(psi) . Ry(phi) . Rz(theta_n) . P_ci_n
+	x = (cph * cth) * C_CABLE_IN_X
+	  + (-cph * sth) * C_CABLE_IN_Y
+	  + (sph) * C_CABLE_IN_Z;
+
+	y = (cps * sth + sps * sph * cth) * C_CABLE_IN_X
+	  + (cps * cth - sps * sph * sth) * C_CABLE_IN_Y
+	  + (-sps * cph) * C_CABLE_IN_Z;
+
+	z = (sps * sth - cps * sph * cth) * C_CABLE_IN_X
+	  + (sps * cth + cps * sph * sth) * C_CABLE_IN_Y
+	  + (cps * cph) * C_CABLE_IN_Z;
+
+	dx = x - C_CABLE_OUT_X;
+	dy = y - C_CABLE_OUT_Y;
+	dz = z - C_CABLE_OUT_Z;
+
+	return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Called once from SIG_INIT, before anything moves.
+//
+// L(home) is computed rather than written down as a constant, so editing
+// the geometry above cannot leave a stale number behind. It is what makes
+// the compensation zero at the home pose, which in turn is what lets the
+// caller's datum keep working untouched.
+///////////////////////////////////////////////////////////////////////////
+void InitToolKinematics(void)
+{
+	g_L_home    = CableSpan(0.0, 0.0, IK_THETA_N_HOME_DEG);
+	g_L_home_ok = 1;
+	print("Tool kinematics: cable span at home = ",g_L_home," mm");
+#if (KIN_1T_MODEL == KIN_1T_COUPLED)
+	print("Tool kinematics: COUPLED - the stage compensates platform tilt");
+#else
+	print("Tool kinematics: *** PASSTHROUGH - TILT IS NOT COMPENSATED ***");
+	print("Tool kinematics: the stage follows the tool box only. Set");
+	print("Tool kinematics: KIN_1T_MODEL to KIN_1T_COUPLED to turn it on.");
+#endif
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// The solver.
+//
+// tool_corr_mm is left as its own visible number rather than folded into
+// the total, because a wrong sign and a wrong model look identical in the
+// total and quite different here.
+///////////////////////////////////////////////////////////////////////////
+void InverseKinematics1T(void)
+{
+	// Backstop only - InitToolKinematics runs in SIG_INIT.
+	if (g_L_home_ok == 0) {
+		g_L_home    = CableSpan(0.0, 0.0, IK_THETA_N_HOME_DEG);
+		g_L_home_ok = 1;
+	}
+
+	// BOTH lengths are summed here, the way the notebook sums them - the
+	// tool command no longer bypasses this file.
+	tool_cmd_mm = User_tool_mm;
+
+#if (KIN_1T_MODEL == KIN_1T_COUPLED)
+	// User_theta_n_deg already carries the 65.53 offset. Do not add it.
+	cable_L      = CableSpan(psi_deg, phi_deg, User_theta_n_deg);
+	// cable length -> carriage displacement, so it can be added to a tool
+	// command that is already a carriage displacement.
+	tool_corr_mm = ((cable_L - g_L_home) * C_TOOL_COMP_DIR) / C_TOOL_COMP_REEVING;
+#else
+	cable_L      = g_L_home;
+	tool_corr_mm = 0;
+#endif
+
+	// ---- the notebook's sum, in this axis's units ----------------------
+	//
+	//     notebook:  total_cable = delta_L_co_ci   + delta_L_ci_th
+	//                            = (L_cur - L_new) + (z_cur - z_new)
+	//
+	// Both of the notebook's terms are negated relative to this axis,
+	// which commands tool ADVANCE. Negating the notebook's sum term by
+	// term gives the two lines below, and the sum of them is the whole
+	// setpoint - there is nothing left for the caller to add.
+	tool_total_mm = tool_cmd_mm + tool_corr_mm;
+
+	// C_1T_POS_DIR inverts the whole axis - command and correction
+	// together - for when positive user units drive the stage the opposite
+	// way to the one the tool box means.
+	final_tool_uu = tool_total_mm * C_TOOL_UU_PER_MM * C_1T_POS_DIR;
+	tool_drum_turns  = tool_total_mm / ((double)C_TOOL_TRAVEL_PER_REV_MM100 / 100.0);
+	tool_motor_turns = tool_drum_turns * (double)C_AXIS_1T_POSFACT_Z / (double)C_AXIS_1T_POSFACT_N;
+
+	// The same move in the notebook's convention: cable paid out, with
+	// both terms negated. Should always be the exact negative of the line
+	// above - if it ever is not, one of the two has drifted.
+	nb_total_cable_mm = (g_L_home - cable_L) + (0.0 - tool_cmd_mm);
+	nb_drum_turns     = nb_total_cable_mm / ((double)C_TOOL_TRAVEL_PER_REV_MM100 / 100.0);
+	nb_motor_turns    = nb_drum_turns * (double)C_AXIS_1T_POSFACT_Z / (double)C_AXIS_1T_POSFACT_N;
+}
+
+#endif // _3R1T_KIN_1T_MH_

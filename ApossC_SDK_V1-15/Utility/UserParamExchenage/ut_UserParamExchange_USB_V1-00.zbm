@@ -1,0 +1,79 @@
+[VARIABLES]
+
+//******************************************************************************************
+// Main Dialog Definition
+//******************************************************************************************
+
+WindowWidth    = 360
+WindowHeight   = 520
+WindowTitle    = User-Parameter Access
+WindowFlags    = 0x0002
+
+OpFlags        = 0x0001
+PollInterval   = 1000
+Fade           = 2,[255.128.0],5,[255.192.128],10,[255.224.192]
+
+
+//******************************************************************************************
+// Default Controller link
+//******************************************************************************************
+$DFLTIF  = Controller,0x0001,(1,USB,6,50,0x0,921600,1)      // USB -> MACS4
+// $DFLTIF  = Controller,0x0001,(1,V24,0,115200,0,6,50,0x7)    // V24 -> MACS3
+
+//******************************************************************************************
+// SDO Definitionen UserVars / Display / Controlword / Status
+//******************************************************************************************
+
+$USRP01 = SDO,0x0001,DFLTIF,0x2201, 1,0,0
+$USRP02 = SDO,0x0001,DFLTIF,0x2201, 2,0,0
+$USRP03 = SDO,0x0001,DFLTIF,0x2201, 3,0,0
+$USRP04 = SDO,0x0001,DFLTIF,0x2201, 4,0,0
+$USRP05 = SDO,0x0001,DFLTIF,0x2201, 5,0,0
+$USRP06 = SDO,0x0001,DFLTIF,0x2201, 6,0,0
+$USRP07 = SDO,0x0001,DFLTIF,0x2201, 7,0,0
+$USRP08 = SDO,0x0001,DFLTIF,0x2201, 8,0,0
+$USRP09 = SDO,0x0001,DFLTIF,0x2201, 9,0,0
+$USRP10 = SDO,0x0001,DFLTIF,0x2201,10,0,0
+
+//******************************************************************************************
+// Title & Controller Selection & Poll on / off
+//******************************************************************************************
+$TITLE   = Text,"User Parameter Access Example",   0,20,10,320,40,-1,24,0x0001
+$BTNCTRL = Button,Controller,"*Select Controller", 0,20,50,120,30,0x0000,Black,DlgGray,DFLTIF
+
+
+//******************************************************************************************
+// User-Parameter Text and Input Fields
+//******************************************************************************************
+$UP01TXT = Text,"User-Parameter 01: ",       0, 60,120, 100,14,-1,14,0x0000
+$UP02TXT = Text,"User-Parameter 02: ", UP01TXT,  0, 30, 100,14,-1,14,0x0000
+$UP03TXT = Text,"User-Parameter 03: ", UP02TXT,  0, 30, 100,14,-1,14,0x0000
+$UP04TXT = Text,"User-Parameter 04: ", UP03TXT,  0, 30, 100,14,-1,14,0x0000
+$UP05TXT = Text,"User-Parameter 05: ", UP04TXT,  0, 30, 100,14,-1,14,0x0000
+$UP06TXT = Text,"User-Parameter 06: ", UP05TXT,  0, 30, 100,14,-1,14,0x0000
+$UP07TXT = Text,"User-Parameter 07: ", UP06TXT,  0, 30, 100,14,-1,14,0x0000
+$UP08TXT = Text,"User-Parameter 08: ", UP07TXT,  0, 30, 100,14,-1,14,0x0000
+$UP09TXT = Text,"User-Parameter 09: ", UP08TXT,  0, 30, 100,14,-1,14,0x0000
+$UP10TXT = Text,"User-Parameter 10: ", UP09TXT,  0, 30, 100,14,-1,14,0x0000
+
+$UP01VAL = Value,"*", UP01TXT,120,-7,0x0102,USRP01,0,0,0
+$UP02VAL = Value,"*", UP02TXT,120,-7,0x0102,USRP02,0,0,0
+$UP03VAL = Value,"*", UP03TXT,120,-7,0x0102,USRP03,0,0,0
+$UP04VAL = Value,"*", UP04TXT,120,-7,0x0102,USRP04,0,0,0
+$UP05VAL = Value,"*", UP05TXT,120,-7,0x0102,USRP05,0,0,0
+$UP06VAL = Value,"*", UP06TXT,120,-7,0x0102,USRP06,0,0,0
+$UP07VAL = Value,"*", UP07TXT,120,-7,0x0102,USRP07,0,0,0
+$UP08VAL = Value,"*", UP08TXT,120,-7,0x0102,USRP08,0,0,0
+$UP09VAL = Value,"*", UP09TXT,120,-7,0x0102,USRP09,0,0,0
+$UP10VAL = Value,"*", UP10TXT,120,-7,0x0102,USRP10,0,0,0
+
+
+//******************************************************************************************
+// Buttons for poll, sending and reading control of the user parameters
+//******************************************************************************************
+$BTNPON     = Button,PollStart,"*  Poll",       BTNCTRL,140,  0, 70, 30,0x0000,Black,DlgGray
+$BTNPOFF    = Button,PollStop, "*No Poll",      BTNPON , 90,  0, 70, 30,0x0000,Black,DlgGray
+$BTNREADALL = Button,Group,"*Read all User-Params",    UP09TXT,-40, 70,130, 30,0x0100,Black,DlgGray, (UP01VAL, UP02VAL, UP03VAL, UP04VAL, UP05VAL, UP06VAL, UP07VAL, UP08VAL, UP09VAL, UP10VAL)
+$BTNSETALL  = Button,Group,"*Set all User-Params",  BTNREADALL,150,  0,130, 30,0x0200,Black,DlgGray, (UP01VAL, UP02VAL, UP03VAL, UP04VAL, UP05VAL, UP06VAL, UP07VAL, UP08VAL, UP09VAL, UP10VAL)
+
+

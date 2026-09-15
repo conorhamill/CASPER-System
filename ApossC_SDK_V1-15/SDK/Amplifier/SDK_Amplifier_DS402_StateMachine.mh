@@ -1,0 +1,192 @@
+/**
+*	@file		SDK_Amplifier_DS402_StateMachine.mh
+*	@brief		Declaration of the DS402 StateMachineFunction.
+*
+*/
+
+#pragma once
+
+/*********************************************************************
+** Declaration of functions
+*********************************************************************/
+
+//State machine
+long sdkDS402_ReadStatusWord(long busId);
+long sdkDS402_ReadControlWord(long busId);
+void sdkDS402_WriteControlWord(long busId, long value);
+long sdkDS402_GetActDriveState(long busId);
+void sdkDS402_PrintState(long state);
+long helperDS402_ExecuteTransition(long busId, long transition);
+long sdkDS402_TransitionToState(long busId, long newState);
+long sdkDS402_WaitTransitionToState(long busId, long targetState, long timeout);
+
+//Profile Mode settings
+void sdkDS402_SetProfileAcceleration(long busId, long acc);
+void sdkDS402_SetProfileDeceleration(long busId, long dec);
+void sdkDS402_SetProfileVelocity(long busId, long vel);
+void sdkDS402_SetMotionProfileType(long busId, long type);
+void sdkDS402_SetMaxProfileVelocity(long busId, long vel);
+void sdkDS402_SetMaxMotorSpeed(long busId, long vel);
+void sdkDS402_SetMaxAcceleration(long busId, long acc);
+void sdkDS402_SetQuickStopDeceleration(long busId, long dec);
+void sdkDS402_SetProfileMovementParameter(long busId, long acc, long dec, long velocity);
+
+//Profile Mode functions
+void sdkDS402_SetOpartionMode(long busId, long operationMode);
+long sdkDS402_GetOpartionMode(long busId);
+void sdkDS402_QuickStop(long busId);
+void sdkDS402_Halt(long busId);
+void sdkDS402_ResetFault(long busId);
+void sdkDS402_Print_StatusWord(long busId);
+void sdkDS402_Print_ControlWord(long busId);
+
+//Profile postion mode PPM
+long helperDS402_PPM_PosStart(long busId, long pos, long relative, long startImmediately);
+long sdkDS402_PPM_PosAbsStart(long busId, long pos, long startImmediately);
+long sdkDS402_PPM_PosRelStart(long busId, long pos, long startImmediately);
+long sdkDS402_PPM_TargetReached(long busId);
+long sdkDS402_PPM_WaitTargetReached(long busId, long timeout);
+
+//Profile velocity mode PVM
+void sdkDS402_PVM_SetTargetVelocity(long busId, long targetVelocity);
+long sdkDS402_PVM_CvelStart(long busId);
+long sdkDS402_PVM_CvelStop(long busId);
+long sdkDS402_PVM_TargetReached(long busId);
+long sdkDS402_PVM_WaitTargetReached(long busId, long timeout);
+
+/*********************************************************************
+** Drive States and Transitions - CiA 402 State Machine
+*********************************************************************/
+#define DS402_DRIVE_STATE_NOT_READY_TO_SWITCH_ON 			1
+#define DS402_DRIVE_STATE_SWITCH_ON_DISABLED				2
+#define DS402_DRIVE_STATE_READY_TO_SWITCH_ON 				3
+#define DS402_DRIVE_STATE_SWITCHED_ON						4
+#define DS402_DRIVE_STATE_OPERATION_ENABLED 				5
+#define DS402_DRIVE_STATE_QUICK_STOP_ACTIVE 				6
+#define DS402_DRIVE_STATE_FAULT_REACTION_ACTIVE				7
+#define DS402_DRIVE_STATE_FAULT								8
+
+//Transitions
+#define DS402_TRANSITION_SHUTDOWN				 			1
+#define DS402_TRANSITION_SWITCH_ON							2
+#define DS402_TRANSITION_ENABLE_OPERATION 					3
+#define DS402_TRANSITION_DISABLE_VOLTAGE 					4
+#define DS402_TRANSITION_DISABLE_OPERATION 					5
+#define DS402_TRANSITION_QUICK_STOP 						6
+#define DS402_TRANSITION_FAULT_RESET 						7
+
+/*********************************************************************
+** OBJECT DICTIONARY - CiA 402
+*********************************************************************/
+#define	DS402_ABORT_CONNECTION_OPTION_CODE				0x6007
+#define	DS402_ERROR_CODE								0x603F
+#define	DS402_CONTROLWORD								0x6040
+		#define DS402_CW_BIT_SWITCH_ON				0
+		#define DS402_CW_BIT_ENABLE_VOLTAGE			1
+		#define DS402_CW_BIT_QUICK_STOP				2
+		#define DS402_CW_BIT_ENABLE_OPERATION		3
+		#define DS402_CW_BIT_HALT					8
+
+		//PPM
+		#define DS402_CW_PPM_BIT_NEW_SETPOINT			4
+		#define DS402_CW_PPM_BIT_CHANGE_IMMEDIATELY	   	5
+		#define DS402_CW_PPM_BIT_RELATIVE_MOVEMENT		6
+		#define DS402_CW_PPM_BIT_ENDLESS_MOVEMENT		15
+
+#define	DS402_STATUSWORD								0x6041
+		#define DS402_SW_BIT_READY_TO_SWITCH_ON		0
+		#define DS402_SW_BIT_SWITCHED_ON			1
+		#define DS402_SW_BIT_OPERATION_ENABLED		2
+		#define DS402_SW_BIT_FAULT					3
+		#define DS402_SW_BIT_VOLTAGE_ENABLED		4
+		#define DS402_SW_BIT_QUICK_STOP				5
+		#define DS402_SW_BIT_SWITCH_ON_DISABLED	   	6
+		#define DS402_SW_BIT_WARNING				7
+		#define DS402_SW_BIT_REMOTE					9
+		#define DS402_SW_BIT_TARGET_REACHED			10
+		#define DS402_SW_BIT_INTERNAL_LIMIT			11 //I2T, Current, max velocity, max speed
+
+		//PPM
+		#define DS402_SW_PPM_BIT_SETPOINT_ACK		12
+		#define DS402_SW_PPM_BIT_FOLLWING_ERROR		13
+
+		//PVM
+		#define DS402_SW_PVM_BIT_SPEED				12
+#define	DS402_QUICK_STOP_OPTION_CODE					0x605A
+#define	DS402_SHUTDOWN_OPTION_CODE						0x605B
+#define	DS402_DISABLE_OPERATION_OPTION_CODE				0x605C
+#define	DS402_FAULT_REACTION_OPTION_CODE				0x605E
+#define	DS402_MODES_OF_OPERATION						0x6060 		// 0x00: Switches the actually chosen operating mode
+		#define DS402_OP_PPM	0x01	// Profile Position Mode
+		#define DS402_OP_PVM	0x03	// Profile Velocity Mode
+		//#define DS402_OP_HMM	0x06	// Homing Mode
+		//#define DS402_OP_CSP	0x08	// Cyclic Synchronous Position Mode
+		//#define DS402_OP_CSV	0x09	// Cyclic Synchronous Velocity Mode
+		//#define DS402_OP_CST	0x0A	// Cyclic Synchronous Torque Mode
+#define	DS402_MODES_OF_OPERATION_DISPLAY				0x6061
+#define	DS402_POSITION_DEMAND_VALUE						0x6062
+#define	DS402_POSITION_ACTUAL_VALUE						0x6064
+#define	DS402_FOLLOWING_ERROR_WINDOW					0x6065
+#define	DS402_FOLLOWING_ERROR_TIMEOUT					0x6066
+#define	DS402_VELOCITY_DEMAND_VALUE						0x606B
+#define	DS402_VELOCITY_ACTUAL_VALUE						0x606C
+#define	DS402_TARGET_TORQUE								0x6071
+#define	DS402_MOTOR_RATED_TORQUE						0x6076
+#define	DS402_TORQUE_ACTUAL_VALUE						0x6077
+#define	DS402_TARGET_POSITION							0x607A
+#define	DS402_POSITION_RANGE_LIMIT						0x607B
+#define	DS402_SOFTWARE_POSITION_LIMIT					0x607D
+#define	DS402_MAX_PROFILE_VELOCITY						0x607F
+#define	DS402_MAX_MOTOR_SPEED							0x6080
+#define	DS402_PROFILE_VELOCITY							0x6081
+#define	DS402_PROFILE_ACCELERATION						0x6083
+#define	DS402_PROFILE_DECELERATION						0x6084
+#define	DS402_QUICK_STOP_DECELERATION					0x6085
+#define	DS402_MOTION_PROFILE_TYPE						0x6086
+#define	DS402_HOMING_METHOD								0x6098		// 0x00: Used to select the desired homing method
+		#define DS402_HOMING_ACT_POSITION			37
+		#define DS402_HOMING_IDX_P_SPEED			34
+		#define DS402_HOMING_IDX_N_SPEED			33
+		#define DS402_HOMING_SWITCH_P_SPEED			23
+		#define DS402_HOMING_SWITCH_N_SPEED			27
+		#define DS402_HOMING_LIMIT_P_SPEED			18
+		#define DS402_HOMING_LIMIT_N_SPEED			17
+		#define DS402_HOMING_SWITCH_IDX_P_SPEED		7
+		#define DS402_HOMING_SWITCH_IDX_N_SPEED		11
+		#define DS402_HOMING_LIMIT_IDX_P_SPEED		2
+		#define DS402_HOMING_LIMIT_IDX_N_SPEED		1
+		#define DS402_HOMING_CURRENT_IDX_P_SPEED	-1
+		#define DS402_HOMING_CURRENT_IDX_N_SPEED	-2
+		#define DS402_HOMING_CURRENT_P_SPEED		-3
+		#define DS402_HOMING_CURRENT_N_SPEED		-4
+#define	DS402_HOMING_SPEEDS								0x6099 		// 0x01: Speed for switch search, 0x02: Speed for zero search
+#define	DS402_HOMING_ACCELERATION						0x609A 		// 0x00: Acceleration and deceleration ramps in the homing profile
+#define	DS402_SI_UNIT_POSITION							0x60A8
+#define	DS402_SI_UNIT_VELOCITY							0x60A9
+#define	DS402_SI_UNIT_ACCELERATION						0x60AA
+#define	DS402_POSITION_OFFSET							0x60B0
+#define	DS402_VELOCITY_OFFSET							0x60B1
+#define	DS402_TORQUE_OFFSET								0x60B2
+#define	DS402_TOUCH_PROBE_FUNCTION						0x60B8
+#define	DS402_TOUCH_PROBE_STATUS						0x60B9
+#define	DS402_TOUCH_PROBE_POSITION_1_POSITIVE_VALUE		0x60BA
+#define	DS402_TOUCH_PROBE_POSITION_1_NEGATIVE_VALUE		0x60BB
+#define	DS402_INTERPOLATION_TIME_PERIOD					0x60C2
+#define	DS402_MAX_ACCELERATION							0x60C5
+#define	DS402_TOUCH_PROBE_SOURCE						0x60D0
+#define	DS402_TOUCH_PROBE_1_POSITIVE_EDGE_COUNTER		0x60D5
+#define	DS402_TOUCH_PROBE_1_NEGATIVE_EDGE_COUNTER		0x60D6
+#define	DS402_ADDITIONAL_POSITION_ACTUAL_VALUES			0x60E4
+#define	DS402_ADDITIONAL_VELOCITY_ACTUAL_VALUES			0x60E5
+#define	DS402_FOLLOWING_ERROR_ACTUAL_VALUE				0x60F4
+#define	DS402_DIGITAL_INPUTS							0x60FD
+#define	DS402_DIGITAL_OUTPUTS							0x60FE
+#define	DS402_TARGET_VELOCITY							0x60FF
+#define	DS402_MOTOR_TYPE								0x6402
+#define	DS402_SUPPORTED_DRIVE_MODES						0x6502
+
+//Profile postion mode constants
+#define DS402_PPM_ABSOLUTE								0
+#define DS402_PPM_RELATIVE								1
+#define DS402_PPM_AFTER_ACTUAL_POSITIONING				0
+#define DS402_PPM_IMMEDIATELY							1

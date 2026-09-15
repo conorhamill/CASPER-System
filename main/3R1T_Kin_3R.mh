@@ -1,0 +1,316 @@
+//=========================================================================
+// 3R1T_Kin_3R.mh   -   the 3R kinematics.   COMPLETE.
+//
+// Closed-form inverse kinematics for the QUB coaxial 3-RRR Spherical
+// Parallel Manipulator: platform orientation in, three motor angles out.
+//
+//   in    psi_deg           rotation about base-frame X          [deg]
+//         phi_deg           rotation about base-frame Y          [deg]
+//         User_theta_n_deg  rotation about the platform normal   [deg]
+//                           INCLUDING the 65.53 deg mechanical home
+//                           offset, which the caller adds.
+//
+//   out   final_theta_1/2/3 proximal motor angles [rad], MULTI-TURN
+//                           (continuous, deliberately not wrapped)
+//
+// Euler convention, used here, on the panel, and nowhere contradicted:
+//         R = Rx(psi) * Ry(phi) * Rz(theta_n)
+// i.e. intrinsic Tait-Bryan X-Y'-Z'': tilt about X, then Y, then spin
+// about the platform normal. theta_n is the infinite-roll axis.
+//
+// Method: for each leg i the closure equation reduces to a quadratic
+//         A_i*T^2 - 2*B_i*T + C_i = 0,   T = tan(theta_i / 2)
+// giving two roots - the two assembly-mode branches - per leg.
+//
+// Infinite-roll and continuity handling follows Algorithm 3 of Tursynbek
+// & Shintemirov, "Infinite rotational motion generation and analysis of a
+// spherical parallel manipulator with coaxial input axes", Mechatronics
+// 78, 2021:
+//   1. Branch selection is a CONTINUITY TRACKER, not "closest to zero".
+//      Each cycle the root nearer (mod 2*pi) to last cycle's chosen angle
+//      is taken and only the wrapped delta is added on. That kills branch
+//      flips AND unwraps the 2*atan +/-pi boundary in one step, so the
+//      angles come out multi-turn and the drives count through full
+//      revolutions.
+//   2. No real solution - discriminant < 0, meaning outside the reachable
+//      orientation set or a Type-II singularity - holds the previous
+//      cycle's values and raises USR_IK_SINGULAR.
+//   3. Leg lap: two motor angles more than 2*pi apart means a proximal
+//      link risks surpassing its neighbour. Flagged via
+//      USR_IK_LINK_SURPASS, never corrected online - a +360 deg jump
+//      would step-fault the drive.
+//
+//
+// >>> THE INPUT MUST MOVE IN SMALL STEPS. <<<
+//
+// The continuity tracker picks whichever root is nearer to last cycle's
+// answer. Feed it a jump bigger than 180 deg and "nearer" is the wrong
+// branch, and it will confidently return a pose that is nothing like the
+// one asked for.
+//
+// This is exactly why the commanded pose lives on simulated axes and is
+// given a profiled move: the 2 ms ISR then sees the pose creep, never
+// jump. Bench check of the maths: theta_n swept 0 -> 720 deg in 0.5 deg
+// steps comes out as a clean 720 deg on all three motors, no singular
+// cycles. The same 720 deg asked for in ONE step does not.
+//
+// If you ever drive psi_deg / phi_deg / User_theta_n_deg from somewhere
+// other than a profiled axis, ramp them yourself.
+//
+//
+// >>> WHERE ZERO IS. <<<
+//
+// At psi = phi = 0 and User_theta_n_deg = 65.53019948 - that is, with the
+// operator asking for zero and the caller having added the mechanical
+// home offset - this solver returns 0.000, -0.0003, -0.0006 deg. The
+// offset is chosen precisely so the home pose IS the zero of all three
+// motor angles.
+//
+// So the caller can treat the output as an offset from the homed
+// position, which is what QUB_3R1T.mc does: it captures each arm's
+// encoder reading the moment homing finishes and adds this on top.
+//
+//
+// >>> THE WORKSPACE ENDS BEFORE THE DRIVES DO. <<<
+//
+// Sweeping the closed form: the psi/phi corner (|psi| = |phi|) is
+// reachable to 32.8 deg and no further, near enough independent of
+// theta_n. Single-axis tilt reaches 45 deg in psi, 47 deg in phi. Past
+// the boundary the discriminant goes negative and rule 2 holds the pose -
+// the machine stops following without stopping. LIM_PSI_CDEG and
+// LIM_PHI_CDEG in 3R1T_Config.mh fence it off at 30 deg so a bad number
+// is refused at the button instead.
+//=========================================================================
+
+#ifndef _3R1T_KIN_3R_MH_
+#define _3R1T_KIN_3R_MH_
+
+
+///////////////////////////////////////////////////////////////////////////
+// Mechanism parameters, evaluated once at load.
+//   alpha1  proximal link arc                    45 deg
+//   alpha2  distal link arc                      45 deg
+//   Eta_i   base attachment angle of leg i        0 / 120 / 240 deg
+///////////////////////////////////////////////////////////////////////////
+double alpha1 = rad(45);
+double alpha2 = rad(45);
+double sin_alpha1 = sin(alpha1);
+double cos_alpha1 = cos(alpha1);
+double sin_alpha2 = sin(alpha2);
+double cos_alpha2 = cos(alpha2);
+
+double Eta_1 = 0.00000000;
+double Eta_2 = 2.0944;			// 120 deg
+double Eta_3 = 4.1888;			// 240 deg
+double sin_Eta_1 = sin(Eta_1);
+double cos_Eta_1 = cos(Eta_1);
+double sin_Eta_2 = sin(Eta_2);
+double cos_Eta_2 = cos(Eta_2);
+double sin_Eta_3 = sin(Eta_3);
+double cos_Eta_3 = cos(Eta_3);
+
+double sqrt3_over_2 = sqrt(3) / 2;
+double half = 0.5;
+
+// beta, the platform attachment arc, is fixed at 45 deg - so its sine and
+// cosine are constants, not something to recompute 500 times a second.
+double beta45      = rad(45);
+double sin_beta45  = sin(beta45);
+double cos_beta45  = cos(beta45);
+
+// The mechanical home configuration angle. The operator's theta_n is
+// measured from the home pose; the solver wants it measured from the
+// mechanism's own zero.
+#define IK_THETA_N_HOME_DEG		65.53019948
+
+
+///////////////////////////////////////////////////////////////////////////
+// Working variables
+///////////////////////////////////////////////////////////////////////////
+double theta_1_neg, theta_2_neg, theta_3_neg;	// branch "-" candidates
+double theta_1_pos, theta_2_pos, theta_3_pos;	// branch "+" candidates
+
+double v_1x, v_1y, v_1z;		// distal joint unit vectors, base frame
+double v_2x, v_2y, v_2z;
+double v_3x, v_3y, v_3z;
+
+double A_1, B_1, C_1;			// per-leg quadratic coefficients
+double A_2, B_2, C_2;
+double A_3, B_3, C_3;
+
+double T1_pos, T1_neg, T2_pos, T2_neg, T3_pos, T3_neg;
+
+// Continuity-tracker state (Algorithm 3 step 1).
+double prev_theta_1 = 0;
+double prev_theta_2 = 0;
+double prev_theta_3 = 0;
+long   ik_continuity_initd = 0;
+
+
+///////////////////////////////////////////////////////////////////////////
+// Roots of A*x^2 + B*x + C = 0.
+//
+// No real solution returns the sentinel 1e9 in both roots. The caller
+// holds last cycle's joint angles and raises USR_IK_SINGULAR rather than
+// commanding 2*atan(1e9), which is very nearly a 180 deg step.
+//
+// Degenerate A ~ 0 collapses the equation to linear and is handled
+// explicitly, so there is no divide by zero on the boundary.
+///////////////////////////////////////////////////////////////////////////
+void solve_quadratic(double A, double B, double C, double &root1, double &root2)
+{
+	double discriminant;
+
+	if (fabs(A) < 1e-12) {				// linear: B*x + C = 0
+		if (fabs(B) < 1e-12) {			// no equation at all
+			root1 = 1e9;
+			root2 = 1e9;
+		} else {
+			root1 = -C / B;
+			root2 = -C / B;
+		}
+		return;
+	}
+
+	discriminant = B * B - 4 * A * C;
+	if (discriminant < 0) {
+		root1 = 1e9;
+		root2 = 1e9;
+	} else {
+		root1 = (-B + sqrt(discriminant)) / (2 * A);
+		root2 = (-B - sqrt(discriminant)) / (2 * A);
+	}
+}
+
+
+// Wrap an angle to (-pi, pi].
+double WrapPi(double a)
+{
+	double pi  = 3.14159265358979323846;
+	double pi2 = 6.28318530717958647692;
+	while (a > pi)   { a = a - pi2; }
+	while (a <= -pi) { a = a + pi2; }
+	return a;
+}
+
+
+// Of the two raw 2*atan roots, return prev plus the smaller wrapped delta.
+// This selects the assembly-mode branch and unwraps the 2*atan boundary in
+// the same step, which is what makes the output multi-turn.
+double PickContinuous(double cand_a, double cand_b, double prev)
+{
+	double da, db;
+	da = WrapPi(cand_a - prev);
+	db = WrapPi(cand_b - prev);
+	if (fabs(da) < fabs(db)) { return prev + da; }
+	return prev + db;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// The solver.
+///////////////////////////////////////////////////////////////////////////
+void InverseKinematicsSPM(void)
+{
+	// The 65.53 home offset is folded into User_theta_n_deg by the ISR,
+	// and the sines and cosines of the pose are computed once per cycle by
+	// UpdatePoseTrig. This solver takes both as given: it must not apply an
+	// offset of its own, or it would be using trig built from a different
+	// angle than the one it thinks it is solving for.
+	//
+	//   g_cps / g_sps   psi        g_cph / g_sph   phi
+	//   g_cth / g_sth   theta_n    sin_beta45      the fixed 45 deg arc
+
+	//---- distal joint unit vectors v1, v2, v3 in the base frame ---------
+	// v_i = Rx(psi)*Ry(phi)*Rz(theta_n) * v_i_platform, expanded inline.
+	//----------------------------- v1 -----------------------------------
+	v_1x = -g_cph * g_sth * sin_beta45 - g_sph * cos_beta45;
+	v_1y = sin_beta45 * (g_cps * g_cth - g_sps * g_sph * g_sth) + g_sps * g_cph * cos_beta45;
+	v_1z = sin_beta45 * (g_sps * g_cth + g_cps * g_sph * g_sth) - cos_beta45 * g_cps * g_cph;
+
+	//----------------------------- v2 -----------------------------------
+	v_2x = (- sqrt3_over_2 * sin_beta45 * g_cph * g_cth) + (half * sin_beta45 * g_cph * g_sth) - (g_sph * cos_beta45);
+	v_2y = - sqrt3_over_2 * sin_beta45 * (g_cps * g_sth + g_sps * g_sph * g_cth) - half * sin_beta45 * (g_cps * g_cth - g_sps * g_sph * g_sth) + cos_beta45 * g_sps * g_cph;
+	v_2z = - sqrt3_over_2 * sin_beta45 * (g_sps * g_sth - g_cps * g_sph * g_cth) - half * sin_beta45 * (g_sps * g_cth + g_cps * g_sph * g_sth) - cos_beta45 * g_cps * g_cph;
+
+	//----------------------------- v3 -----------------------------------
+	v_3x = sqrt3_over_2 * sin_beta45 * g_cph * g_cth + half * sin_beta45 * g_cph * g_sth - g_sph * cos_beta45;
+	v_3y = sqrt3_over_2 * sin_beta45 * (g_cps * g_sth + g_sps * g_sph * g_cth) - half * sin_beta45 * (g_cps * g_cth - g_sps * g_sph * g_sth) + cos_beta45 * g_sps * g_cph;
+	v_3z = sqrt3_over_2 * sin_beta45 * (g_sps * g_sth - g_cps * g_sph * g_cth) - half * sin_beta45 * (g_sps * g_cth + g_cps * g_sph * g_sth) - cos_beta45 * g_cps * g_cph;
+
+	//---- per-leg quadratic coefficients (closure equations) -------------
+	A_1 = sin_Eta_1 * sin_alpha1 * v_1x - cos_Eta_1 * sin_alpha1 * v_1y - cos_alpha1 * v_1z - cos_alpha2;
+	B_1 = cos_Eta_1 * sin_alpha1 * v_1x + sin_Eta_1 * sin_alpha1 * v_1y;
+	C_1 = -sin_Eta_1 * sin_alpha1 * v_1x + cos_Eta_1 * sin_alpha1 * v_1y - cos_alpha1 * v_1z - cos_alpha2;
+
+	A_2 = sin_Eta_2 * sin_alpha1 * v_2x - cos_Eta_2 * sin_alpha1 * v_2y - cos_alpha1 * v_2z - cos_alpha2;
+	B_2 = cos_Eta_2 * sin_alpha1 * v_2x + sin_Eta_2 * sin_alpha1 * v_2y;
+	C_2 = -sin_Eta_2 * sin_alpha1 * v_2x + cos_Eta_2 * sin_alpha1 * v_2y - cos_alpha1 * v_2z - cos_alpha2;
+
+	A_3 = sin_Eta_3 * sin_alpha1 * v_3x - cos_Eta_3 * sin_alpha1 * v_3y - cos_alpha1 * v_3z - cos_alpha2;
+	B_3 = cos_Eta_3 * sin_alpha1 * v_3x + sin_Eta_3 * sin_alpha1 * v_3y;
+	C_3 = -sin_Eta_3 * sin_alpha1 * v_3x + cos_Eta_3 * sin_alpha1 * v_3y - cos_alpha1 * v_3z - cos_alpha2;
+
+	// Solve for T_i = tan(theta_i / 2).
+	solve_quadratic(A_1, -2 * B_1, C_1, T1_pos, T1_neg);
+	solve_quadratic(A_2, -2 * B_2, C_2, T2_pos, T2_neg);
+	solve_quadratic(A_3, -2 * B_3, C_3, T3_pos, T3_neg);
+
+	//---- step 2: singular / unreachable ---------------------------------
+	if (T1_pos > 1e8 || T1_neg > 1e8 ||
+	    T2_pos > 1e8 || T2_neg > 1e8 ||
+	    T3_pos > 1e8 || T3_neg > 1e8) {
+		USER_PARAM(USR_IK_SINGULAR) = 1;
+		USER_PARAM(USR_IK_SINGULAR_COUNT) = USER_PARAM(USR_IK_SINGULAR_COUNT) + 1;
+		final_theta_1 = prev_theta_1;
+		final_theta_2 = prev_theta_2;
+		final_theta_3 = prev_theta_3;
+		return;
+	}
+	USER_PARAM(USR_IK_SINGULAR) = 0;
+
+	// Candidate angles from both branches.
+	theta_1_neg = 2 * atan(T1_neg);
+	theta_2_neg = 2 * atan(T2_neg);
+	theta_3_neg = 2 * atan(T3_neg);
+	theta_1_pos = 2 * atan(T1_pos);
+	theta_2_pos = 2 * atan(T2_pos);
+	theta_3_pos = 2 * atan(T3_pos);
+
+	//---- step 1: continuity-tracked, multi-turn branch pick -------------
+	// The first cycle, and any cycle after USR_IK_RESET_CONT is written,
+	// seeds prev_theta at zero - which is the home pose, so the picker
+	// degenerates to "closest to zero" exactly where that is right.
+	// Homing writes USR_IK_RESET_CONT for this reason.
+	if (ik_continuity_initd == 0 || USER_PARAM(USR_IK_RESET_CONT) == 1) {
+		prev_theta_1 = 0;
+		prev_theta_2 = 0;
+		prev_theta_3 = 0;
+		ik_continuity_initd = 1;
+		USER_PARAM(USR_IK_RESET_CONT) = 0;
+	}
+
+	final_theta_1 = PickContinuous(theta_1_neg, theta_1_pos, prev_theta_1);
+	final_theta_2 = PickContinuous(theta_2_neg, theta_2_pos, prev_theta_2);
+	final_theta_3 = PickContinuous(theta_3_neg, theta_3_pos, prev_theta_3);
+
+	//---- step 3: leg-lap detection, report only -------------------------
+	{
+		double pi2 = 6.28318530717958647692;
+		double d12, d23, d31;
+		d12 = fabs(final_theta_1 - final_theta_2);
+		d23 = fabs(final_theta_2 - final_theta_3);
+		d31 = fabs(final_theta_3 - final_theta_1);
+		if (d12 > pi2 || d23 > pi2 || d31 > pi2) {
+			USER_PARAM(USR_IK_LINK_SURPASS) = 1;
+		} else {
+			USER_PARAM(USR_IK_LINK_SURPASS) = 0;
+		}
+	}
+
+	prev_theta_1 = final_theta_1;
+	prev_theta_2 = final_theta_2;
+	prev_theta_3 = final_theta_3;
+}
+
+#endif // _3R1T_KIN_3R_MH_

@@ -1,0 +1,44 @@
+/**
+*	@file		SDK_Error_Description.mh
+*	@brief		Declaration of Error Codes.
+*	$Revision: 261 $
+*
+*/
+
+void sdkErrorPrint_ApossIdeErrorDescription(long errorCode);
+void sdkErrorPrint_SdoErrorDescription(long errorCode);
+
+//------------------------------------------------
+// CiA 301 SDO abort codes
+//------------------------------------------------
+#define 	SDO_ERR_TOGGLE_BIT			0x5030000
+#define 	SDO_ERR_TIMEOUT				0x5040000
+#define 	SDO_ERR_COMMAND				0x5040001
+#define 	SDO_ERR_BLOCK_SIZE			0x5040002
+#define 	SDO_ERR_BLOCK_SEQUENCE		0x5040003
+#define 	SDO_ERR_BLOCK_CRC			0x5040004
+#define 	SDO_ERR_MEMORY				0x5040005
+#define 	SDO_ERR_ACCESS_UNSUPPORTED	0x6010000
+#define 	SDO_ERR_ACCESS_WO			0x6010001
+#define 	SDO_ERR_ACCESS_RO			0x6010002
+#define 	SDO_ERR_NO_OBJECT			0x6020000
+#define 	SDO_ERR_MAPPING_OBJECT		0x6040041
+#define 	SDO_ERR_MAPPING_LENGTH		0x6040042
+#define 	SDO_ERR_GENERAL_PARAMETER	0x6040043
+#define 	SDO_ERR_GENERAL_DEVICE		0x6040047
+#define 	SDO_ERR_HARDWARE			0x6060000
+#define 	SDO_ERR_DATATYPE			0x6070010
+#define 	SDO_ERR_DATATYPE_HIGH  		0x6070012
+#define 	SDO_ERR_DATATYPE_LOW		0x6070013
+#define 	SDO_ERR_NO_SUB_INDEX		0x6090011
+#define 	SDO_ERR_VALUE_RANGE			0x6090030
+#define 	SDO_ERR_VALUE_HIGH			0x6090031
+#define 	SDO_ERR_VALUE_LOW			0x6090032
+#define 	SDO_ERR_VALUE_MIN_MAX		0x6090036
+#define 	SDO_ERR_SDO_CONNECTION		0x60A0023
+#define 	SDO_ERR_GENERAL				0x8000000
+#define 	SDO_ERR_DATA_STORE			0x8000020
+#define 	SDO_ERR_DATA_STORE_LOCAL	0x8000021
+#define 	SDO_ERR_DATA_STORE_STATE	0x8000022
+#define 	SDO_ERR_OBJECT_DICTIONARY	0x8000023
+#define 	SDO_ERR_NO_DATA				0x8000024

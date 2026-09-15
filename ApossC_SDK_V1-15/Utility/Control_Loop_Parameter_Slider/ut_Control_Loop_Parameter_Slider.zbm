@@ -1,0 +1,357 @@
+[VARIABLES]
+
+///////////////////////////////////////////////////////////////////////
+//
+// Main Dialog Definition
+//
+//     WindowWidth   	=> Width of main dialog window.
+//     WindowHeight  	=> Height of main dialog window.
+//     WindowTitle   	=> Title for dialog window.
+//     WindowFlags      => Flags for controlling window behaviour:
+//
+//                            0x0001 - Maximize window:  0 - No (default), 1 - Yes.
+//                            0x0002 - System menu:  0 - Hide, 1 - Show (default).
+//                            0x0004 - ESC close:  0 - Disabled (default), 1 - Enabled.
+//                            0x0008 - Size boxes:  0 - Hide (default), 1 - Show.
+//                            0x0010 - Resizing:  0 - Disabled (default), 1 - Enabled.
+//                            0x0020 - Title move:  0 - Disabled (default), 1 - Enabled.
+//
+///////////////////////////////////////////////////////////////////////
+
+WindowWidth    = 990
+WindowHeight   = 940
+WindowTitle    = Controll Loop Adjust
+WindowFlags    = 0x0002
+
+///////////////////////////////////////////////////////////////////////
+//
+// Operating Parameters
+//
+//     OpFlags          => Flags for controlling dialog operating behaviour:
+//
+//                            0x0001 - Start polling on open:  0 - No (default), 1 - Yes.
+//
+//     PollInterval     => Polling interval (in ms).  Default is 1000 ms if not specified.
+//     Fade             => Fade list for SDO value changes.  This list is as follows:
+//
+//                            time1,colour1,time2,colour2,time3,colour3
+//
+//                         The list can contain 0 or more time/colour pairs.  The pairs must
+//                         be ordered by increasing time.  The SDO background colour will be
+//                         the specified colour for the specified length of time after the
+//                         value has changed.
+//
+///////////////////////////////////////////////////////////////////////
+
+OpFlags        = 0x0001
+PollInterval   = 2000
+Fade           = 2,[255.128.0],5,[255.192.128],10,[255.224.192]
+
+///////////////////////////////////////////////////////////////////////
+//
+// Main Dialog Layout
+//
+// Layout elements within the dialog are specified as follows:
+//
+//     $# = type,specification
+//
+// where:  #             - Element number.  Numbers must be unique but need not be
+//                         sequential.  However, there must not be a gap of more
+//                         than 100 between consecutive numbers.
+//         type          - Type of element being specified (see below).
+//         specification - Specification of layout element.  The format of this
+//                         depends on the type of element being specified.
+//
+// Warning: Currently, there cannot be more than 800 dialog elements.
+//
+// Valid element types are:
+//
+//     Controller   - Defines a connection to a controller.  This is non-displayable.
+//     SDO          - Defines an SDO.  This is non-displayable.
+//     Table        - Defines a table.  This is non-displayable.
+//     Box          - Defines a group box.
+//     Bitmap       - Defines a bitmap image.
+//     Text         - Defines a text string.
+//     Bit          - Defines a colour box to display a bit status.
+//     Button       - Defines a button.
+//     List         - Defines a listbox.
+//     Value        - Defines an SDO value control.
+//
+// Specifications are as follows:
+//
+//     Controller   - flags,(connection)
+//     SDO          - flags,ctrl,index,subindex,addndx,addsub
+//     Table        - flags,(list)
+//     Box          - label,offset,x,y,width,height,flags
+//     Bitmap       - filename,offset,x,y,flags
+//     Text         - string,offset,x,y,width,height,just,font,flags
+//     Bit          - offset,x,y,width,height,flags,oncolour,offcolour,undefcolour,source,bitmask
+//     Button       - type,label,offset,x,y,width,height,flags,textcolour,facecolour,params
+//     List         - type,offset,x,y,width,drop-height,flags,params
+//     Value        - label,offset,x,y,flags,sdo,format,addval,scale
+//
+// where:  flags    - Flags (element-specific).
+//         conn     - Connection specification.
+//         ctrl     - Element number of controller.
+//         sdo      - Element number of SDO.
+//         table    - Element number if table to be used for the listbox.
+//         index    - SDO index (as hexadecimal, including the "0x").
+//         subindex - SDO subindex.
+//         addndx   - Element number if element value is to be added to SDO index.  0 otherwise.
+//         addsub   - Element number if element value is to be added to SDO subindex.  0 otherwise.
+//         list     - List contents as ("String 1",Value 1,"String 2",Value 2,...).  The
+//                    first character of each string must be '*' and will be ingored.  Strings
+//                    cannot be longer than 50 characters.
+//         label    - Label to be placed on element.  This must be enclosed in double
+//                    quotes and begin with "*".
+//         offset   - Element number from which the (x,y) position is offset.  0 if absolute (x,y).
+//         x        - The X coordinate of the upper left corner of the element within the dialog.
+//         y        - The Y coordinate of the upper left corner of the element within the dialog.
+//         width    - Width of the element within the dialog.
+//         height   - Height of the element within the dialog.
+//         filename - Filename of ".bmp" file.
+//         string   - Text string to be placed within the dialog.
+//                    This must be enclosed in double quotes.
+//         just     - Text string justification within the text box:
+//                    -1 - Left, 0 - Center, 1 - Right.
+//         font     - Text font size.
+//         subtype  - Type of element being specified (described below).
+//         colour   - Colour string.  This may be specified as either a colour name or
+//                    an [r.g.b] string (e.g. [128.255.25]).  The following colour names
+//                    are supported:  Black, White, Gray, DlgGray, Red, Green, Blue,
+//                                    Yellow, Cyan, Magenta, DarkRed, DarkGreen, DarkBlue,
+//                                    Orange, Olive, Purple.
+//         bitmask  - Bit mask specified in hex (e.g. 0x0002).
+//         params   - Element-specific parameters (described below).
+//         format   - Display format: 0 - long, 1 - hexadecimal.
+//         addval   - Element number if element value is to be added to value.  0 otherwise.
+//         scale    - Scale factor for display.  0 for no scaling.
+//
+// Button types are:
+//
+//     Close        - Close the dialog.  This is ignored for Tune Oscilloscope Monitors.
+//     PollStart    - Start polling.
+//     PollStop     - Stop polling.
+//     Controller   - Select a new controller.
+//     Get          - Gets an SDO value.
+//     Set          - Sets an SDO value.
+//     Group        - Defines a button to execute a function on a group of elements.
+//
+// Button parameters (where expected) are:
+//
+//     Controller   - source
+//     Get          - sdo
+//     Set          - sdo,value,addval
+//     Group        - (elements)
+//
+// where:  value    - SDO value (long or hex).
+//         elements - List of element numbers seperated by commas.
+//
+// Button Flags:
+//
+//     All:    0x0001  - Hide the button.
+//     Group:  0x0100  - "Read" each SDO element and "Click" each Get element.
+//             0x0200  - "Write" each SDO element and "Click" each Set element.
+//
+// Button parameters (where expected) are:
+//
+//     Table        - table
+//     Axis         - ctrl
+//     Lookup       - sdo,table
+//
+// Controller element flags:
+//
+//     0x0001       - Connect controller on open.
+//
+// SDO element flags:
+//
+//     0x0001       - SDO should be polled.
+//     0x0002       - SDO is read-only.
+//     0x0004       - Poll SDO once after initial connection (or reconnection).
+//
+// Text element flags:
+//
+//     0x0001       - Use bold font.
+//
+// List types are:
+//
+//     Table        - The list contains items from a table.
+//     Axis         - The list contains axis numbers from a controller.
+//     Lookup       - The list contains SDO-selectable items.
+//
+// Lookup list flags:
+//
+//     0x0001       - Lookup element is read-only.
+//     0x0002       - Automatically write if user changes value.
+//
+// Value element flags:
+//
+//     0x0001       - Value is read-only.
+//     0x0002       - Blink value when Read button is pressed.
+//     0x0004       - Automatically write if user changes value and leaves field.
+//     0x0100       - Use the "small" child dialog.
+//     0x0200       - Use the "display" child dialog (no Read or Write buttons).
+//
+///////////////////////////////////////////////////////////////////////
+
+$Ctrl  = Controller,0x0001,(1,USB,6,50,0x0,921600,1)
+
+
+//******************************************************************************************
+// Titel - Logo - - Bild
+//******************************************************************************************
+$TextTitle = Text,"Control Loop Parameter Settings",0,20,30,600,40,-1,24,0x0001
+$SelectCtr = Button,Controller,"*Select Controller" ,0,400,30,150,30,0x0000,Black,DlgGray,Ctrl
+
+$TextAxis = Text,"Axis:",-,25,80,80,15,-1,14,0x0001,Black,-
+$Axis    = List,Axis,TextAxis,50,-5,50,200,0x0000,-,{Ctrl}
+
+
+
+//******************************************************************************************
+// Position PID Parameter
+//******************************************************************************************
+$BoxPIDCntr = Box,"*Position PID-Parameter", 0,20,120,950,400,0x0000
+
+$SDO_Kprop_Ax  = SDO,0x000D,Ctrl,0x2300,12,Axis,0
+$SDO_Kder_Ax   = SDO,0x000D,Ctrl,0x2300,13,Axis,0
+$SDO_Kint_Ax   = SDO,0x000D,Ctrl,0x2300,14,Axis,0
+$SDO_Kilim_Ax  = SDO,0x000D,Ctrl,0x2300,22,Axis,0
+$SDO_Bbandwh_Ax = SDO,0x000D,Ctrl,0x2300,36,Axis,0
+$SDO_FFvel_Ax  = SDO,0x000D,Ctrl,0x2300,37,Axis,0
+$SDO_FFacc_Ax  = SDO,0x000D,Ctrl,0x2300,38,Axis,0
+$SDO_KFFACC_Ax  = SDO,0x000D,Ctrl,0x2300,135,Axis,0
+$SDO_KFFDEC_Ax  = SDO,0x000D,Ctrl,0x2300,136,Axis,0
+
+
+$TextKPROP = Text,"KPROP:     ",BoxPIDCntr,20, 35,170,14,-1,14,0x0000
+$TextKDER  = Text,"KDER:      ",BoxPIDCntr,20, 70,170,14,-1,14,0x0000
+$TextKINT  = Text,"KINT:      ",BoxPIDCntr,20,105,170,14,-1,14,0x0000
+$TextKILIM = Text,"KILIM:     ",BoxPIDCntr,20,140,170,14,-1,14,0x0000
+$TextBANDWH = Text,"BANDWIDTH: ",BoxPIDCntr,20,175,170,14,-1,14,0x0000
+$TextFFVEL = Text,"FFVEL:     ",BoxPIDCntr,20,210,170,14,-1,14,0x0000
+$TextFFACC = Text,"FFACC:     ",BoxPIDCntr,20,245,170,14,-1,14,0x0000
+$TextKFFACC = Text,"KFFACC:     ",BoxPIDCntr,20,280,170,14,-1,14,0x0000
+$TextKFFDEC = Text,"KFFDEC:     ",BoxPIDCntr,20,315,170,14,-1,14,0x0000
+
+$Val_11 = Value,"*", TextKPROP,80,-7,0x0200,SDO_Kprop_Ax,0,0,0
+$Val_12 = Value,"*", TextKDER,80,-7,0x0200,SDO_Kder_Ax,0,0,0
+$Val_13 = Value,"*", TextKINT,80,-7,0x0200,SDO_Kint_Ax,0,0,0
+$Val_14 = Value,"*", TextKILIM,80,-7,0x0200,SDO_Kilim_Ax,0,0,0
+$Val_15 = Value,"*", TextBANDWH,80,-7,0x0200,SDO_Bbandwh_Ax,0,0,0
+$Val_16 = Value,"*", TextFFVEL,80,-7,0x0200,SDO_FFvel_Ax,0,0,0
+$Val_17 = Value,"*", TextFFACC,80,-7,0x0200,SDO_FFacc_Ax,0,0,0
+$Val_18 = Value,"*", TextKFFACC,80,-7,0x0200,SDO_KFFACC_Ax,0,0,0
+$Val_19 = Value,"*", TextKFFDEC,80,-7,0x0200,SDO_KFFDEC_Ax,0,0,0
+
+$161 = Button,Group,"*Set Params", Val_19,-5,40,95,30,0x0200,Black,DlgGray,   (Val_11,Val_12,Val_13,Val_14,Val_15,Val_16,Val_17,Val_18,Val_19)
+
+$HSlider31 = Slider     ,Val_11,150,-5,600,35,0x0003,SDO_Kprop_Ax,0,4000,-
+$Low31     = Text,"  0 ",Val_11,120,2,100,30,-1,15,0x0001
+$High31    = Text,"4000",Val_11,760,2,100,30,-1,15,0x0001
+
+$HSlider32 = Slider     ,Val_12,150,-5,600,35,0x0003,SDO_Kder_Ax,0,5000,-
+$Low32     = Text,"  0 ",Val_12,120,2,100,30,-1,15,0x0001
+$High32    = Text,"5000",Val_12,760,2,100,30,-1,15,0x0001
+
+$HSlider33 = Slider     ,Val_13,150,-5,600,35,0x0003,SDO_Kint_Ax,0,1000,-
+$Low33     = Text,"  0 ",Val_13,120,2,100,30,-1,15,0x0001
+$High33    = Text,"1000",Val_13,760,2,100,30,-1,15,0x0001
+
+$HSlider34 = Slider     ,Val_14,150,-5,600,35,0x0003,SDO_Kilim_Ax,0,1000,-
+$Low34     = Text,"  0 ",Val_14,120,2,100,30,-1,15,0x0001
+$High34    = Text,"1000",Val_14,760,2,100,30,-1,15,0x0001
+
+$HSlider35 = Slider     ,Val_15,150,-5,600,35,0x0003,SDO_Bbandwh_Ax,0,1000,-
+$Low35     = Text,"   0 ",Val_15,120,2,100,30,-1,15,0x0001
+$High35    = Text,"1000",Val_15,760,2,100,30,-1,15,0x0001
+
+$HSlider36 = Slider     ,Val_16,150,-5,600,35,0x0003,SDO_FFvel_Ax,0,2000,-
+$Low36     = Text,"  0 ",Val_16,120,2,100,30,-1,15,0x0001
+$High36    = Text,"2000",Val_16,760,2,100,30,-1,15,0x0001
+
+$HSlider37 = Slider     ,Val_17,150,-5,600,35,0x0003,SDO_FFacc_Ax,0,9000,-
+$Low37     = Text,"  0 ",Val_17,120,2,100,30,-1,15,0x0001
+$High37    = Text,"9000",Val_17,760,2,100,30,-1,15,0x0001
+
+$HSlider38 = Slider     ,Val_18,150,-5,600,35,0x0003,SDO_KFFACC_Ax,0,9000,-
+$Low38     = Text,"  0 ",Val_18,120,2,100,30,-1,15,0x0001
+$High38    = Text,"9000",Val_18,760,2,100,30,-1,15,0x0001
+
+$HSlider39 = Slider     ,Val_19,150,-5,600,35,0x0003,SDO_KFFDEC_Ax,0,9000,-
+$Low39     = Text,"  0 ",Val_19,120,2,100,30,-1,15,0x0001
+$High39    = Text,"9000",Val_19,760,2,100,30,-1,15,0x0001
+
+//******************************************************************************************
+// Current Control Parameter
+//******************************************************************************************
+$BoxCurPIDCntr = Box,"*Current PI-Parameter", BoxPIDCntr,0,410,950,190,0x0000
+
+
+$SDO_CurKprop_Ax  = SDO,0x000D,Ctrl,0x4000,33,Axis,0
+$SDO_CurKint_Ax   = SDO,0x000D,Ctrl,0x4000,34,Axis,0
+$SDO_CurKilim_Ax  = SDO,0x000D,Ctrl,0x4000,35,Axis,0
+
+$TextCURKPROP = Text,"CURKPROP:     ",BoxCurPIDCntr,20, 35,170,14,-1,14,0x0000
+$TextCURKINT  = Text,"CURKINT:      ",BoxCurPIDCntr,20,70,170,14,-1,14,0x0000
+$TextCURKILIM = Text,"CURKILIM:     ",BoxCurPIDCntr,20,105,170,14,-1,14,0x0000
+
+
+$Val_21 = Value,"*", TextCURKPROP,80,-7,0x0200,SDO_CurKprop_Ax,0,0,0
+$Val_22 = Value,"*", TextCURKINT,80,-7,0x0200,SDO_CurKint_Ax,0,0,0
+$Val_23 = Value,"*", TextCURKILIM,80,-7,0x0200,SDO_CurKilim_Ax,0,0,0
+
+
+//$160 = Button,Group,"*Read RegulParams",   0,200,70,150,30,0x0200,Black,DlgGray, (131,132,133,134,135,136,137,141,142,143,144,145,146,147,151,152,153,154,155,156,157)
+$161 = Button,Group,"*Set Params", Val_23,-5,40,95,30,0x0200,Black,DlgGray,   (Val_21,Val_22,Val_23)
+
+
+$HSlider41 = Slider     ,Val_21,150,-5,600,35,0x0003,SDO_CurKprop_Ax,0,32000,-
+$Low41     = Text,"  0 ",Val_21,120,2,100,30,-1,15,0x0001
+$High41    = Text,"20000",Val_21,760,2,100,30,-1,15,0x0001
+
+$HSlider42 = Slider     ,Val_22,150,-5,600,35,0x0003,SDO_CurKint_Ax,0,32000,-
+$Low42     = Text,"  0 ",Val_22,120,2,100,30,-1,15,0x0001
+$High42    = Text,"32000",Val_22,760,2,100,30,-1,15,0x0001
+
+$HSlider43 = Slider     ,Val_23,150,-5,600,35,0x0003,SDO_CurKilim_Ax,0,32000,-
+$Low43     = Text,"  0 ",Val_23,120,2,100,30,-1,15,0x0001
+$High43    = Text,"32000",Val_23,760,2,100,30,-1,15,0x0001
+
+//******************************************************************************************
+// Velocity Parameter
+//******************************************************************************************
+$BoxVelPICntr = Box,"*Velocity PI-Parameter", 0,20,730,950,190,0x0000
+
+$SDO_VelKprop_Ax  = SDO,0x000D,Ctrl,0x4000,30,Axis,0
+$SDO_VelKint_Ax   = SDO,0x000D,Ctrl,0x4000,31,Axis,0
+$SDO_VelKilim_Ax  = SDO,0x000D,Ctrl,0x4000,32,Axis,0
+
+$TextVELKPROP = Text,"VELKPROP:     ",BoxVelPICntr,20, 35,170,14,-1,14,0x0000
+$TextVELKINT  = Text,"VELKINT:      ",BoxVelPICntr,20,70,170,14,-1,14,0x0000
+$TextVELKILIM = Text,"VELKILIM:     ",BoxVelPICntr,20,105,170,14,-1,14,0x0000
+
+$Val_31 = Value,"*", TextVELKPROP,80,-7,0x0200,SDO_VelKprop_Ax,0,0,0
+$Val_32 = Value,"*", TextVELKINT,80,-7,0x0200,SDO_VelKint_Ax,0,0,0
+$Val_33 = Value,"*", TextVELKILIM,80,-7,0x0200,SDO_VelKilim_Ax,0,0,0
+
+$161 = Button,Group,"*Set Params", Val_33,-5,40,95,30,0x0200,Black,DlgGray,   (Val_31,Val_32,Val_33)
+
+
+$HSlider31 = Slider     ,Val_31,150,-5,600,35,0x0003,SDO_VelKprop_Ax,0,32000,-
+$Low31     = Text,"  0 ",Val_31,120,2,100,30,-1,15,0x0001
+$High31    = Text,"20000",Val_31,760,2,100,30,-1,15,0x0001
+
+$HSlider32 = Slider     ,Val_32,150,-5,600,35,0x0003,SDO_VelKint_Ax,0,32000,-
+$Low32     = Text,"  0 ",Val_32,120,2,100,30,-1,15,0x0001
+$High32    = Text,"32000",Val_32,760,2,100,30,-1,15,0x0001
+
+$HSlider33 = Slider     ,Val_33,150,-5,600,35,0x0003,SDO_VelKilim_Ax,0,32000,-
+$Low33     = Text,"  0 ",Val_33,120,2,100,30,-1,15,0x0001
+$High33    = Text,"32000",Val_33,760,2,100,30,-1,15,0x0001
+
+
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
