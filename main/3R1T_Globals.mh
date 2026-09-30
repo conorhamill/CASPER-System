@@ -274,6 +274,39 @@ double g_path_seg_max   = 0;	// biggest step between two samples  [mm]
 dim long  GeneralData[20];							// 0x2100  array 0
 dim long  MoveSequenceData[C_SEQUENCE_SIZE][9];		// 0x2101  array 1
 
+///////////////////////////////////////////////////////////////////////////
+// Teleoperation.
+//
+// The reference capture is the whole reason entering teleop cannot jump.
+// The PC has its own clutch and its own idea of where the pose is, and the
+// two need not agree - it may have been restarted, or the rig may have
+// been moved with MOVE since. So on entry the rig records BOTH sides as
+// they are at that instant and applies only the difference thereafter:
+//
+//     want = g_tele_base + (USER_PARAM(USR_TGT_*) - g_tele_ref)
+//
+// At the instant of entry the bracket is zero, so want == where we already
+// are, whatever the PC happens to be sending. Belt and braces with the
+// PC-side clutch, and it costs four longs.
+long g_tele_ref_psi  = 0;	// the PC's demand at the moment of entry [cdeg]
+long g_tele_ref_phi  = 0;
+long g_tele_ref_thn  = 0;
+long g_tele_ref_tool = 0;	// [0.01 mm]
+
+long g_tele_base_psi  = 0;	// where the pose was at the moment of entry
+long g_tele_base_phi  = 0;
+long g_tele_base_thn  = 0;
+long g_tele_base_tool = 0;
+
+long g_tele_hb        = 0;	// last heartbeat value seen
+long g_tele_hb_ms     = 0;	// Time() when it last changed
+long g_tele_next_ms   = 0;	// when the next retarget is due
+long g_tele_following = 0;	// 1 = enable held and the pose is live
+long g_tele_want_psi  = 0;	// the last target actually issued, so the
+long g_tele_want_phi  = 0;	// deadband has something to compare against
+long g_tele_want_thn  = 0;
+long g_tele_want_tool = 0;
+
 long g_traj_row     = 0;	// next row to read, 0-based
 long g_traj_mode    = TRJ_IDLE;
 long g_traj_last    = 0;	// the final waypoint is running, let it finish

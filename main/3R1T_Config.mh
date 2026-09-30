@@ -273,6 +273,27 @@
 #define USR_TGT_THETA_N		12	// [cdeg]
 #define USR_TGT_TOOL		13	// [0.01 mm]
 
+// --- teleoperation, WRITTEN BY THE PC ------------------------------------
+//
+// The haptic program streams USR_TGT_* above at about 100 Hz and writes
+// these alongside them. It never writes USR_COMMAND except to ask for
+// teleop once, so the targets are inert until the Teleop state is running.
+//
+// >>> THE HEARTBEAT IS THE ONLY THING KEEPING THE RIG ALIVE IN TELEOP. <<<
+//
+// A streamed pose has no natural end. If the PC crashes, the USB or the
+// Ethernet stalls, or Windows decides to install something, the last
+// target simply stops changing - which is indistinguishable from an
+// operator holding still. So the PC must INCREMENT slot 14 every cycle and
+// the rig drops out of teleop if it stops. This is the same reasoning as
+// CAN_STALE_MS for the sensor node, and the same remedy.
+#define USR_TELE_HEARTBEAT	14	// PC increments every cycle. Any value.
+#define USR_TELE_ENABLE		15	// 1 = the operator is holding the enable
+#define USR_TELE_VEL_ROT	16	// follow speed, angles [cdeg/s]
+#define USR_TELE_VEL_TOOL	17	// follow speed, tool   [0.01 mm/s]
+#define USR_TELE_ACC_SCALE	18	// accel as a percentage of the move accel
+#define USR_TELE_SPARE		19	// reserved, so the block stays contiguous
+
 // --- sensors, straight off CAN2 -----------------------------------------
 #define USR_THETA1			20	// arm 1 joint angle, IMU  [cdeg]
 #define USR_THETA2			21	// arm 2
@@ -376,6 +397,17 @@
 #define USR_ERROR_NO		72
 #define USR_ERROR_INFO		73
 
+// --- teleoperation, WRITTEN BY THE RIG -----------------------------------
+// What the PC reads back to know whether it is actually in control.
+#define USR_TELE_STATE		74	// TELE_*
+#define USR_TELE_HB_SEEN	75	// last heartbeat value the rig saw
+#define USR_TELE_HB_AGE		76	// ms since it last changed
+#define USR_TELE_MAX_AGE	77	// worst gap this session [ms] - the number
+								// that says whether the link is good enough
+#define USR_TELE_TRIPS		78	// watchdog drop-outs since power-up
+#define USR_TELE_CLAMPED	79	// bit0 psi, bit1 phi, bit2 theta_n, bit3 tool
+								// - the rig clamped the PC's demand here
+
 // --- the fault snapshot -------------------------------------------------
 // >>> LATCHED AT THE MOMENT OF THE FAULT AND NOT TOUCHED AGAIN. <<<
 //
@@ -405,6 +437,7 @@
 #define ST_READY			5
 #define ST_MOVING			6
 #define ST_TRAJ				7
+#define ST_TELEOP			8
 
 
 ///////////////////////////////////////////////////////////////////////////
@@ -500,6 +533,7 @@
 #define C_CMD_HOME			0x08
 #define C_CMD_TRAJ_SINGLE	0x10	// run the loaded trajectory once
 #define C_CMD_TRAJ_CONT		0x20	// run it endlessly until STOP
+#define C_CMD_TELEOP		0x40	// hand the pose to the haptic device
 #define C_CMD_ERROR_CLR		0x100
 
 #define C_STA_READY			0x01	// homed, streaming, will accept MOVE
@@ -510,6 +544,7 @@
 #define C_STA_STREAM		0x20	// drives are following the kinematics
 #define C_STA_TOGGLE		0x40	// 1 Hz life beat
 #define C_STA_TRAJ			0x80	// a trajectory is running
+#define C_STA_TELEOP		0x100	// the haptic device has the pose
 
 // USR_LED - exactly one of these is set at a time.
 #define LED_GREEN			0x01	// good, homed, ready to move
@@ -873,6 +908,67 @@
 #define TRJ_CONTINUOUS		2
 
 ///////////////////////////////////////////////////////////////////////////
+// SECTION 7c - TELEOPERATION
+//
+// The haptic device streams a pose; this is what the rig does with it.
+//
+// >>> THE POSE STILL GOES THROUGH THE SIMULATED AXES. <<<
+//
+// Teleop does NOT write the pose into the 2 ms interrupt. It retargets the
+// same four simulated axes that MOVE and TRAJECTORY use, and the interrupt
+// carries on reading Cpos() exactly as it always has. Three reasons, and
+// they all matter more than the extra 20 ms of lag it costs:
+//
+//   1. the profile generator is what keeps the steps small. 3R1T_Kin_3R.mh
+//      is explicit that its continuity tracker returns a confidently WRONG
+//      pose if handed a jump, and that anything driving the pose from
+//      somewhere other than a profiled axis must ramp it itself. Reusing
+//      the profile means not re-solving a solved problem in an interrupt.
+//   2. entering and leaving teleop is then free. The simulated axes stay
+//      the single authority on where the pose is, so nothing has to be
+//      re-synced on the way out and "psi = 0" goes on meaning the homed
+//      pose rather than wherever teleop happened to stop.
+//   3. TrajRun already retargets these axes mid-move and has a track
+//      record doing it. Teleop is the same trick at a steadier rate.
+//
+// If the follow ever feels too soft, the honest fix is a second-order
+// filter in the interrupt with the simulated axes slaved to it - a bigger
+// change than this, and not one to make before the profile version has
+// been felt.
+///////////////////////////////////////////////////////////////////////////
+
+// USR_TELE_STATE values.
+#define TELE_OFF			0
+#define TELE_WAIT_ENABLE	1	// in the state, enable not held yet
+#define TELE_FOLLOW			2	// following the device
+#define TELE_DROPPED		3	// watchdog fired, pose held
+
+// >>> HOW LONG THE RIG WILL BELIEVE A STALE HEARTBEAT. <<<
+// The PC streams at about 100 Hz, so 10 ms a cycle. 150 ms is fifteen
+// missed cycles - long enough that a Windows hiccup or a garbage-collection
+// pause does not drop the operator mid-move, short enough that a crashed
+// program cannot leave the rig following a frozen target.
+#define C_TELE_STALE_MS		150
+
+// How often the state machine pushes a new target at the simulated axes.
+// Not the PC's rate and not the interrupt's: re-issuing a coordinated move
+// faster than the profile generator can digest one buys nothing, and the
+// PC is only producing new poses every 10 ms anyway.
+#define C_TELE_RETARGET_MS	20
+
+// Below this, a change in the demand is not worth a new move. Stops hand
+// tremor and the last digit of IMU noise from re-kicking the profile
+// generator hundreds of times a second.
+#define C_TELE_DEADBAND_CDEG	3	// 0.03 deg
+#define C_TELE_DEADBAND_TOOL	2	// 0.02 mm
+
+// Defaults for the tunables in slots 16-18, applied at boot. Deliberately
+// SLOWER than the MOVE defaults: a hand moves faster than a needle should.
+#define C_TELE_VEL_ROT_DEF	400		// [cdeg/s]     4 deg/s
+#define C_TELE_VEL_TOOL_DEF	300		// [0.01 mm/s]  3 mm/s
+#define C_TELE_ACC_PCT_DEF	50		// % of the MOVE acceleration
+
+///////////////////////////////////////////////////////////////////////////
 // SECTION 8 - STATUS MESSAGES
 //
 // The program writes one of these codes to USR_MSG and the panel looks up
@@ -945,5 +1041,17 @@
 #define MSG_WARN_SING		54	// "WARNING: IK singular - pose held"
 #define MSG_WARN_SURPASS	55	// "WARNING: leg lap risk - legs far apart"
 #define MSG_CAN_RESET		56	// "CAN receivers re-armed"
+
+// --- teleoperation ------------------------------------------------------
+// >>> ADD THESE TO TableOfMessages IN 3R1T_traj_panel.zbm TOO. <<<
+// Same numbers. A code with no table entry shows blank on the panel, so a
+// missing one is quiet rather than wrong - but quiet is still no use.
+#define MSG_TELE_ENTER		66	// "TELEOP: hold the enable to take control"
+#define MSG_TELE_FOLLOW		67	// "TELEOP: following the haptic device"
+#define MSG_TELE_RELEASE	68	// "TELEOP: enable released - pose held"
+#define MSG_TELE_LOST		69	// "TELEOP: link lost - pose held"
+#define MSG_TELE_EXIT		70	// "TELEOP: finished"
+#define MSG_TELE_NO_LINK	71	// "TELEOP refused: no heartbeat from the PC"
+#define MSG_TELE_NOT_HOMED	72	// "TELEOP refused: home the rig first"
 
 #endif // _3R1T_CONFIG_MH_

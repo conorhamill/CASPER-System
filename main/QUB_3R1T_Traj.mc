@@ -53,6 +53,21 @@
 *				profile, so there is nothing there to stop.
 *
 *
+*				TELEOPERATION
+*
+*				A haptic device on a PC can drive the pose instead of the
+*				MOVE button. It streams the same four targets over
+*				Ethernet at about 100 Hz and the Teleop state retargets
+*				the same four simulated axes - so the profile generator,
+*				the kinematics and the 2 ms interrupt are all unchanged
+*				and unaware. See SECTION 7c in Config for why it is done
+*				that way rather than in the interrupt.
+*
+*				Control is handed over only while the operator holds an
+*				enable, and taken back the moment the PC's heartbeat
+*				stops. The PC side lives in ../haptic.
+*
+*
 *				POWER
 *
 *				Everything energises at startup. There are no power
@@ -556,6 +571,144 @@ void StartPoseMove(void)
 
 
 ///////////////////////////////////////////////////////////////////////////
+// Teleoperation
+//
+// See SECTION 7c in Config for why the pose still goes through the
+// simulated axes rather than into the 2 ms interrupt.
+///////////////////////////////////////////////////////////////////////////
+
+// Track the PC's heartbeat. Called from the top-level SIG_IDLE so it runs
+// in EVERY state, not just Teleop: the panel can then show whether the
+// haptic link is alive before anyone asks to use it, and entering Teleop
+// does not have to guess.
+long TeleopFresh(void)
+{
+	long hb, now, age;
+
+	hb  = USER_PARAM(USR_TELE_HEARTBEAT);
+	now = Time();
+	if (hb != g_tele_hb) {
+		g_tele_hb    = hb;
+		g_tele_hb_ms = now;
+		USER_PARAM(USR_TELE_HB_SEEN) = hb;
+	}
+
+	age = now - g_tele_hb_ms;
+	USER_PARAM(USR_TELE_HB_AGE) = age;
+
+	// Only worth recording the worst gap while somebody is actually
+	// streaming, or it fills up with the hours the PC was switched off.
+	if (age < C_TELE_STALE_MS && age > USER_PARAM(USR_TELE_MAX_AGE)) {
+		USER_PARAM(USR_TELE_MAX_AGE) = age;
+	}
+
+	return((age <= C_TELE_STALE_MS) ? TRUE : FALSE);
+}
+
+
+// Record both sides of the mapping as they are right now. See the note on
+// g_tele_ref_* in 3R1T_Globals.mh - this is what makes taking control
+// jump-free no matter what the PC is sending at the time.
+void TeleopCapture(void)
+{
+	g_tele_ref_psi   = USER_PARAM(USR_TGT_PSI);
+	g_tele_ref_phi   = USER_PARAM(USR_TGT_PHI);
+	g_tele_ref_thn   = USER_PARAM(USR_TGT_THETA_N);
+	g_tele_ref_tool  = USER_PARAM(USR_TGT_TOOL);
+
+	g_tele_base_psi  = Cpos(EE_PSI);
+	g_tele_base_phi  = Cpos(EE_PHI);
+	g_tele_base_thn  = Cpos(EE_THETA_N);
+	g_tele_base_tool = Cpos(EE_TOOL);
+
+	g_tele_want_psi  = g_tele_base_psi;
+	g_tele_want_phi  = g_tele_base_phi;
+	g_tele_want_thn  = g_tele_base_thn;
+	g_tele_want_tool = g_tele_base_tool;
+
+	g_tele_next_ms   = 0;
+}
+
+
+// One retarget of the simulated axes towards where the operator's hand is.
+void TeleopRetarget(void)
+{
+	long p, h, n, t, mask, moved, vRot, vTool, aRot, aTool, tvmax;
+
+	// The PC's demand, as a delta from what it was demanding when control
+	// was taken, applied to where the pose was at that moment.
+	p = g_tele_base_psi  + (USER_PARAM(USR_TGT_PSI)     - g_tele_ref_psi);
+	h = g_tele_base_phi  + (USER_PARAM(USR_TGT_PHI)     - g_tele_ref_phi);
+	n = g_tele_base_thn  + (USER_PARAM(USR_TGT_THETA_N) - g_tele_ref_thn);
+	t = g_tele_base_tool + (USER_PARAM(USR_TGT_TOOL)    - g_tele_ref_tool);
+
+	// >>> CLAMP HERE. DO NOT REFUSE. <<<
+	//
+	// PoseCommandOk refuses an out-of-range MOVE and says which axis, which
+	// is right for a number somebody typed. Mid-stream a refusal is wrong:
+	// the operator gets no explanation they can feel, because this machine
+	// reflects no force to the haptic device, and a rig that silently stops
+	// following looks broken. So the demand is clamped and the fact is
+	// published for the PC to show on screen.
+	//
+	// The PC clamps too, against the same LIM_* figures parsed out of this
+	// file. This is the backstop, not the fence.
+	mask = 0;
+	if (p >  LIM_PSI_CDEG)     { p =  LIM_PSI_CDEG;     mask = mask | 0x01; }
+	if (p < -LIM_PSI_CDEG)     { p = -LIM_PSI_CDEG;     mask = mask | 0x01; }
+	if (h >  LIM_PHI_CDEG)     { h =  LIM_PHI_CDEG;     mask = mask | 0x02; }
+	if (h < -LIM_PHI_CDEG)     { h = -LIM_PHI_CDEG;     mask = mask | 0x02; }
+	if (n >  LIM_THETA_N_CDEG) { n =  LIM_THETA_N_CDEG; mask = mask | 0x04; }
+	if (n < -LIM_THETA_N_CDEG) { n = -LIM_THETA_N_CDEG; mask = mask | 0x04; }
+	if (t >  LIM_TOOL_MM100)   { t =  LIM_TOOL_MM100;   mask = mask | 0x08; }
+	if (t < -LIM_TOOL_MM100)   { t = -LIM_TOOL_MM100;   mask = mask | 0x08; }
+	USER_PARAM(USR_TELE_CLAMPED) = mask;
+
+	// Nothing has moved enough to be worth a new profile. Hand tremor and
+	// the last digit of the device's own noise would otherwise re-kick the
+	// profile generator on every single pass.
+	moved = 0;
+	if (AbsL(p - g_tele_want_psi)  > C_TELE_DEADBAND_CDEG) { moved = 1; }
+	if (AbsL(h - g_tele_want_phi)  > C_TELE_DEADBAND_CDEG) { moved = 1; }
+	if (AbsL(n - g_tele_want_thn)  > C_TELE_DEADBAND_CDEG) { moved = 1; }
+	if (AbsL(t - g_tele_want_tool) > C_TELE_DEADBAND_TOOL) { moved = 1; }
+	if (moved == 0) { return; }
+
+	g_tele_want_psi  = p;
+	g_tele_want_phi  = h;
+	g_tele_want_thn  = n;
+	g_tele_want_tool = t;
+
+	// The follow speeds. Separate figures for the angles and the tool, for
+	// the reason spelled out beside USR_MOVE_VEL: they are different units
+	// on different drivetrains and must never share a number.
+	vRot  = USER_PARAM(USR_TELE_VEL_ROT);
+	vTool = USER_PARAM(USR_TELE_VEL_TOOL);
+	if (vRot  < 1) { vRot  = 1; }
+	if (vTool < 1) { vTool = 1; }
+
+	aRot  = (USER_PARAM(USR_MOVE_ACC) * USER_PARAM(USR_TELE_ACC_SCALE)) / 100;
+	aTool = (USER_PARAM(USR_TOOL_ACC) * USER_PARAM(USR_TELE_ACC_SCALE)) / 100;
+	if (aRot  < 1) { aRot  = 1; }
+	if (aTool < 1) { aTool = 1; }
+
+	// The stage's own ceiling, as StartPoseMove applies it. There is no
+	// path to scan here, so this is the only thing standing between a fast
+	// tilt and asking the carriage for more cable than it can pay out.
+	tvmax = (C_TOOL_MAX_UU_S * 3) / 4;
+	if (tvmax < 1)     { tvmax = 1; }
+	if (vTool > tvmax) { vTool = tvmax; }
+
+	SetVelAccDec(EE_PSI,     vRot,  aRot,  aRot);
+	SetVelAccDec(EE_PHI,     vRot,  aRot,  aRot);
+	SetVelAccDec(EE_THETA_N, vRot,  aRot,  aRot);
+	SetVelAccDec(EE_TOOL,    vTool, aTool, aTool);
+
+	AxisLinAbsStart(EE_PSI, p, EE_PHI, h, EE_THETA_N, n, EE_TOOL, t);
+}
+
+
+///////////////////////////////////////////////////////////////////////////
 // TEMPORARY: the tool kinematics trace.
 //
 // Prints the quantities the reference notebook prints, so the rig can be
@@ -928,6 +1081,22 @@ SmState MainMachine {
 		USER_PARAM(USR_TGT_THETA_N)      = 0;
 		USER_PARAM(USR_TGT_TOOL)         = 0;
 
+		// Teleop. The tunables get defaults here; the PC may overwrite them
+		// at any time. The enable starts CLEAR so a stale 1 left in the
+		// slot from a previous session cannot hand control straight over.
+		USER_PARAM(USR_TELE_HEARTBEAT)   = 0;
+		USER_PARAM(USR_TELE_ENABLE)      = 0;
+		USER_PARAM(USR_TELE_VEL_ROT)     = C_TELE_VEL_ROT_DEF;
+		USER_PARAM(USR_TELE_VEL_TOOL)    = C_TELE_VEL_TOOL_DEF;
+		USER_PARAM(USR_TELE_ACC_SCALE)   = C_TELE_ACC_PCT_DEF;
+		USER_PARAM(USR_TELE_SPARE)       = 0;
+		USER_PARAM(USR_TELE_STATE)       = TELE_OFF;
+		USER_PARAM(USR_TELE_HB_SEEN)     = 0;
+		USER_PARAM(USR_TELE_HB_AGE)      = 0;
+		USER_PARAM(USR_TELE_MAX_AGE)     = 0;
+		USER_PARAM(USR_TELE_TRIPS)       = 0;
+		USER_PARAM(USR_TELE_CLAMPED)     = 0;
+
 		USER_PARAM(USR_TRAJ_STATE)       = TRJ_IDLE;
 		USER_PARAM(USR_TRAJ_STEP)        = 0;
 		USER_PARAM(USR_TRAJ_LEN)         = 0;
@@ -1119,6 +1288,9 @@ SmState MainMachine {
 
 	SIG_IDLE = {
 		CanPoll();
+		// Tracked in every state, not just Teleop, so the panel can show
+		// whether the haptic PC is alive before anyone asks to use it.
+		TeleopFresh();
 		USER_PARAM(USR_ERROR_NO)   = ErrorNo();
 		USER_PARAM(USR_ERROR_INFO) = ErrorInfo();
 
@@ -1353,6 +1525,12 @@ SmState MainMachine {
 			if (cmd == C_CMD_MOVE) {
 				print("MOVE refused: not homed");
 				Say(MSG_MOVE_NO_HOME);
+			}
+			if (cmd == C_CMD_TELEOP) {
+				// The pose the device streams is measured from the home
+				// pose. Without a datum there is nothing for it to mean.
+				print("TELEOP refused: not homed");
+				Say(MSG_TELE_NOT_HOMED);
 			}
 			if (cmd == C_CMD_STOP) {
 				StopEverything();
@@ -1948,6 +2126,18 @@ SmState MainMachine {
 				return(SmTrans(TrajRun));
 			}
 
+			if (cmd == C_CMD_TELEOP) {
+				// Refuse rather than enter a state that cannot do anything.
+				// Teleop with no heartbeat would sit in TELE_WAIT_ENABLE
+				// for ever and look like a hang.
+				if (USER_PARAM(USR_TELE_HB_AGE) > C_TELE_STALE_MS) {
+					print("TELEOP refused: no heartbeat from the PC - is the haptic program running?");
+					Say(MSG_TELE_NO_LINK);
+					return(SmNotHandled);
+				}
+				return(SmTrans(Teleop));
+			}
+
 			if (cmd == C_CMD_STOP) {
 				// Nothing is moving, but say so anyway - a button that
 				// appears to do nothing is worse than one that reports.
@@ -2021,6 +2211,140 @@ SmState MainMachine {
 
 		SIG_EXIT = {
 			StaClr(C_STA_MOVING);
+		}
+	}
+
+
+	///////////////////////////////////////////////////////////////////////
+	// Teleop - the haptic device has the pose.
+	//
+	// The state is entered with the enable NOT held. Taking control is a
+	// separate, deliberate act: hold the enable on the device and the rig
+	// starts following; let go and it stops where it is. So there are two
+	// ways out of following - releasing the enable, and the watchdog - and
+	// only one way in.
+	//
+	// >>> RELEASING THE ENABLE IS NOT AN EMERGENCY STOP. <<<
+	//
+	// It is a button on the far side of a USB cable, a Python program and
+	// an Ethernet link. It stops the rig following in the ordinary case and
+	// that is all it is for. The watchdog is what covers the PC dying, and
+	// the hardware E-stop is what covers everything else.
+	//
+	// >>> AND NEITHER IS THE CLAMP. <<<
+	//
+	// TeleopRetarget clamps the demand to LIM_* and publishes the fact, but
+	// the operator feels nothing when it bites - this machine reflects no
+	// force back to the device. The clamp keeps the rig inside its fence;
+	// it does not tell the hand to stop. That is the PC's job, on screen.
+	///////////////////////////////////////////////////////////////////////
+	SmState Teleop {
+		SIG_ENTRY = {
+			if (g_verbose) print("3R1T -> Teleop");
+			g_state_id = ST_TELEOP;
+			SetLed(LED_AMBER);
+			StaSet(C_STA_TELEOP);
+			StaClr(C_STA_READY);
+
+			g_tele_following = 0;
+			USER_PARAM(USR_TELE_STATE) = TELE_WAIT_ENABLE;
+
+			// Start the freshness clock from now. The heartbeat was checked
+			// before the transition, but priming it here means a slow first
+			// cycle cannot look like a dropped link.
+			g_tele_hb    = USER_PARAM(USR_TELE_HEARTBEAT);
+			g_tele_hb_ms = Time();
+
+			TeleopCapture();
+			Say(MSG_TELE_ENTER);
+			print("TELEOP: entered. Hold the enable on the haptic device to take control.");
+			print("TELEOP: follow speeds ",USER_PARAM(USR_TELE_VEL_ROT)," cdeg/s and ",USER_PARAM(USR_TELE_VEL_TOOL)," UU/s, accel ",USER_PARAM(USR_TELE_ACC_SCALE)," %");
+		}
+
+		SIG_IDLE = {
+			long cmd, fresh, enable;
+
+			cmd = USER_PARAM(USR_COMMAND);
+			if (cmd != 0) {
+				USER_PARAM(USR_COMMAND) = 0;
+
+				// STOP and a second TELEOP both leave. Stopping the pose
+				// axes is enough - the drives follow the kinematics to a
+				// standstill with them, exactly as in Moving. Do NOT
+				// AxisStop a real axis here.
+				if (cmd == C_CMD_STOP || cmd == C_CMD_TELEOP) {
+					AxisStop(EE_PSI, EE_PHI, EE_THETA_N, EE_TOOL);
+					if (g_verbose) print("TELEOP: left at psi=",Cpos(EE_PSI)," phi=",Cpos(EE_PHI)," theta_n=",Cpos(EE_THETA_N)," tool=",Cpos(EE_TOOL));
+					Say(MSG_TELE_EXIT);
+					return(SmTrans(Ready));
+				}
+
+				if (cmd == C_CMD_HOME) {
+					AxisStop(EE_PSI, EE_PHI, EE_THETA_N, EE_TOOL);
+					return(SmTrans(Homing->Home3RMeasure));
+				}
+			}
+
+			// The parent's SIG_IDLE has already refreshed the heartbeat
+			// figures this pass; this only reads the verdict.
+			fresh  = (USER_PARAM(USR_TELE_HB_AGE) <= C_TELE_STALE_MS) ? TRUE : FALSE;
+			enable = (USER_PARAM(USR_TELE_ENABLE) == 1) ? TRUE : FALSE;
+
+			// ---- the watchdog ------------------------------------------
+			if (fresh == FALSE) {
+				if (g_tele_following == 1) {
+					g_tele_following = 0;
+					AxisStop(EE_PSI, EE_PHI, EE_THETA_N, EE_TOOL);
+					USER_PARAM(USR_TELE_TRIPS) = USER_PARAM(USR_TELE_TRIPS) + 1;
+					USER_PARAM(USR_TELE_STATE) = TELE_DROPPED;
+					Say(MSG_TELE_LOST);
+					print("TELEOP: no heartbeat for ",USER_PARAM(USR_TELE_HB_AGE)," ms - pose held. Drop-out ",USER_PARAM(USR_TELE_TRIPS)," this power-up");
+				}
+				// Stay in the state. The link may come back, and the
+				// operator still has to press STOP to leave - a rig that
+				// silently returned to Ready would be one where nobody
+				// could tell whether the link had ever worked.
+				return(SmNotHandled);
+			}
+
+			// ---- the enable --------------------------------------------
+			if (enable == FALSE) {
+				if (g_tele_following == 1) {
+					g_tele_following = 0;
+					AxisStop(EE_PSI, EE_PHI, EE_THETA_N, EE_TOOL);
+					USER_PARAM(USR_TELE_STATE) = TELE_WAIT_ENABLE;
+					Say(MSG_TELE_RELEASE);
+					if (g_verbose) print("TELEOP: enable released - pose held");
+				}
+				// Re-reference on every idle pass while not following, so
+				// however far the hand wanders in the meantime, taking
+				// control again starts from where the pose actually is.
+				TeleopCapture();
+				return(SmNotHandled);
+			}
+
+			if (g_tele_following == 0) {
+				g_tele_following = 1;
+				TeleopCapture();
+				USER_PARAM(USR_TELE_STATE) = TELE_FOLLOW;
+				Say(MSG_TELE_FOLLOW);
+				if (g_verbose) print("TELEOP: following from psi=",Cpos(EE_PSI)," phi=",Cpos(EE_PHI)," theta_n=",Cpos(EE_THETA_N)," tool=",Cpos(EE_TOOL));
+			}
+
+			// ---- follow -------------------------------------------------
+			// Rate-limited on purpose. See C_TELE_RETARGET_MS.
+			if (Time() >= g_tele_next_ms) {
+				g_tele_next_ms = Time() + C_TELE_RETARGET_MS;
+				TeleopRetarget();
+			}
+			return(SmNotHandled);
+		}
+
+		SIG_EXIT = {
+			g_tele_following = 0;
+			StaClr(C_STA_TELEOP);
+			USER_PARAM(USR_TELE_STATE)   = TELE_OFF;
+			USER_PARAM(USR_TELE_CLAMPED) = 0;
 		}
 	}
 
