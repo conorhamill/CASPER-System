@@ -24,6 +24,10 @@
 //     it comes out as one continuous movement rather than a series of
 //     separate moves. STOP ends it wherever it is.
 //
+//  5. To drive it by hand: start the haptic program on the PC, press
+//     TELEOP, then hold a clutch on the stylus. The four command boxes
+//     follow your hand while it streams. STOP ends it.
+//
 //  HOME always brings it back, from anywhere, including out of an error.
 //  STOP holds the pose where it is.
 //
@@ -50,7 +54,7 @@
 ///////////////////////////////////////////////////////////////////////
 
 WindowWidth  = 560
-WindowHeight = 600
+WindowHeight = 730
 WindowFlags  = 0x0000
 WindowTitle  = QUB 3R1T - trajectory
 
@@ -64,6 +68,7 @@ $MACS_MASTER = Controller,0x0000,1,(1,USB,6,50,0x0,921600,1)
 #define SCALE_CDEG   100    // centidegrees -> degrees
 #define SCALE_MM100  100    // 0.01 mm      -> mm
 #define SCALE_UM    1000    // microns      -> mm
+#define SCALE_NONE     1    // raw counts, no conversion
 
 
 ///////////////////////////////////////////////////////////////////////
@@ -112,6 +117,17 @@ $SDO_State   = SDO,0x0001,MACS_MASTER,0x2201, 2,0,0
 //  change while it runs, and change back when it ends - that is the
 //  program swapping the file's speed in and out, not a fault.
 $SDO_MoveVel = SDO,0x0001,MACS_MASTER,0x2201,60,0,0
+
+//  Teleoperation. Slots 74 / 76 / 78 in 3R1T_Config.mh. Read-only here:
+//  the haptic PC writes slots 14-19, the rig writes these.
+$SDO_TeleSt  = SDO,0x0001,MACS_MASTER,0x2201,74,0,0
+$SDO_TeleAge = SDO,0x0001,MACS_MASTER,0x2201,76,0,0
+$SDO_TeleTrp = SDO,0x0001,MACS_MASTER,0x2201,78,0,0
+
+//  Slot 19 is the tremor band, and unlike the three above it is WRITTEN
+//  here - the same auto-write arrangement as the speed box. Polled too,
+//  so it shows what the band actually is rather than what was last typed.
+$SDO_TeleTrm = SDO,0x0001,MACS_MASTER,0x2201,19,0,0
 
 
 ///////////////////////////////////////////////////////////////////////
@@ -256,3 +272,61 @@ $Btn_TStp = Button,Set,"*STOP",       Box_Trj,335,64,120,30,0x0000, Red,   DlgGr
 
 $Lamp_Trj = Bit,Box_Trj,15,102,18,18,0x0000,Green,Gray,DlgGray,SDO_State,0x80
 $Txt_TrjR = Text,"running", Lamp_Trj,26,2,80,16,-1,15,0x0001
+
+
+///////////////////////////////////////////////////////////////////////
+//  HAPTIC
+//
+//  TELEOP hands the pose to the haptic PC. It is refused unless the rig
+//  is homed and the PC's heartbeat is alive - the terminal says which.
+//
+//  Taking control is then a separate act: hold a clutch on the stylus.
+//  There is deliberately no enable button here. An enable you can walk
+//  away from is not an enable.
+//
+//  The four command boxes above are not duplicated here. They are bound
+//  to slots 10-13, which is exactly what the haptic PC streams into, so
+//  they already follow the stylus - at the 200 ms poll rate, which is
+//  enough to see that the link is alive and nothing like enough to judge
+//  how it feels. The PC's own window is for that.
+//
+//  link age is milliseconds since the PC's heartbeat last changed. Under
+//  20 while it streams; a few million means no PC has ever run. The rig
+//  stops following past C_TELE_STALE_MS and counts a drop-out.
+//
+//  state:  0 off   1 waiting for the enable   2 following   3 dropped
+//
+//  tremor is how much the hand may wander before the rig follows at all,
+//  in degrees. Type a new one and tab out, the same as the speed box. The
+//  PC reads it and filters before it sends, so it takes effect on the
+//  next update with nothing to restart.
+//
+//  It is a trade, not a free win: within the band the rig ignores you,
+//  and once moving it trails your hand by that much. 1 deg is quiet;
+//  raise it if the rig still buzzes, lower it if the follow feels slack.
+//  0 turns it off.
+//
+//  >>> THE LAMP MASK IS 0x100, WIDER THAN EVERY OTHER ONE HERE. <<<
+//  C_STA_TELEOP is the first status bit above the low byte. If the panel
+//  truncates a Bit mask to a byte the lamp will simply never light -
+//  nothing else in the group is affected, and "state" says the same
+//  thing in a number. Do not go looking in the .mc for it.
+///////////////////////////////////////////////////////////////////////
+$Box_Hap = Box,"*Haptic",0,15,586,520,118,0x0000
+
+$Btn_Tele = Button,Set,"*TELEOP", Box_Hap,15,22,150,30,0x0000, Blue, DlgGray, SDO_Cmd, 0x40, 0
+
+$Lamp_Tel = Bit,Box_Hap,180,26,18,18,0x0000,Green,Gray,DlgGray,SDO_State,0x100
+$Txt_TelL = Text,"in teleop", Lamp_Tel,26,2,80,16,-1,15,0x0001
+
+$Txt_TSt  = Text,"state:",         Box_Hap, 15,62,100,16,-1,15,0x0000
+$Val_TSt  = Value,"*", Box_Hap,120,60,0x0201,SDO_TeleSt, 0,0,SCALE_NONE
+
+$Txt_HbA  = Text,"link age [ms]:", Box_Hap,300,22,100,16,-1,15,0x0000
+$Val_HbA  = Value,"*", Box_Hap,405,20,0x0201,SDO_TeleAge,0,0,SCALE_NONE
+
+$Txt_Trp  = Text,"drop-outs:",     Box_Hap,300,48,100,16,-1,15,0x0000
+$Val_Trp  = Value,"*", Box_Hap,405,46,0x0201,SDO_TeleTrp,0,0,SCALE_NONE
+
+$Txt_Trem = Text,"tremor [deg]:",  Box_Hap, 15,88,100,16,-1,15,0x0000
+$Val_Trem = Value,"*", Box_Hap,120,86,0x0204,SDO_TeleTrm,0,0,SCALE_CDEG

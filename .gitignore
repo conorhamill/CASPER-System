@@ -4,3 +4,6 @@ __pycache__/
 
 # Bench and teleop logs
 *.csv
+
+# Third-party reference clone, not ours to vendor
+archive/pyOpenHaptics/

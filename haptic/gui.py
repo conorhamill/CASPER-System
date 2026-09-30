@@ -108,6 +108,7 @@ class Shared:
     max_age: int = 0
     trips: int = 0
     clamped_rig: int = 0
+    tremor: int = 0
     ik: tuple = (0, 0, 0, 0)
     led: int = 0
 
@@ -159,6 +160,16 @@ class Worker(threading.Thread):
             try:
                 self._macs = MacsTcp(ip).open()
                 self._set(macs_ok=True, note=f"controller at {ip}")
+                # A controller still running a pre-tremor build leaves slot
+                # 19 at zero, which this code is entitled to read as "band
+                # off". Say so rather than quietly not filtering.
+                band = self._macs.read_param(slot("USR_TELE_TREMOR"))
+                self.cfg.tremor_deg = max(0.0, band / 100.0)
+                self._set(tremor=band)
+                if band == 0:
+                    self._set(note=f"controller at {ip} - TREMOR BAND IS 0, "
+                                   f"no filtering. Download the current .mc, "
+                                   f"or set it here and Apply.")
             except MacsTcpError as e:
                 self._set(note=f"controller found but not open: {e}")
         else:
@@ -168,6 +179,11 @@ class Worker(threading.Thread):
         self._dev = Touch().open()
         if not self._dev.is_live():
             raise RuntimeError("Touch returns no valid orientation - check its power")
+
+        # The insertion wall is ON from the start. It is the only fence the
+        # operator can actually feel, so leaving it as something to remember
+        # to switch on was the wrong default.
+        self._set_wall(True)
         self._set(touch_ok=True, note="ready")
 
     def _shutdown(self):
@@ -206,11 +222,13 @@ class Worker(threading.Thread):
                     else:
                         self._set(note="release the clutches before zeroing")
                 elif name == "speeds" and self._macs:
-                    vr, vt, acc = value
+                    vr, vt, acc, tremor = value
                     self._macs.write_param(slot("USR_TELE_VEL_ROT"), vr)
                     self._macs.write_param(slot("USR_TELE_VEL_TOOL"), vt)
                     self._macs.write_param(slot("USR_TELE_ACC_SCALE"), acc)
-                    self._set(note=f"follow speeds -> {vr}, {vt}, {acc}%")
+                    self._macs.write_param(slot("USR_TELE_TREMOR"), tremor)
+                    self._set(note=f"follow {vr}, {vt}, {acc}%, "
+                                   f"tremor {tremor/100:.2f} deg")
                 elif name == "wall":
                     self._set_wall(bool(value))
             except MacsTcpError as e:
@@ -288,6 +306,12 @@ class Worker(threading.Thread):
 
                 if n % STATUS_EVERY == 0:
                     try:
+                        # The band is applied HERE, on the PC, so the
+                        # targets leave already smooth. The panel owns the
+                        # number; this picks up whatever it was set to.
+                        band = self._macs.read_param(slot("USR_TELE_TREMOR"))
+                        self.cfg.tremor_deg = max(0.0, band / 100.0)
+                        self._set(tremor=band)
                         self._set(
                             rig_state  = self._macs.read_param(slot("USR_STATE")),
                             rig_msg    = self._macs.read_param(slot("USR_MSG")),
@@ -369,21 +393,22 @@ class App:
         for i, (lbl, key, default) in enumerate((
                 ("angles [cdeg/s]", "vr", D.get("C_TELE_VEL_ROT_DEF", 400)),
                 ("tool [0.01 mm/s]", "vt", D.get("C_TELE_VEL_TOOL_DEF", 300)),
-                ("accel [% of MOVE]", "acc", D.get("C_TELE_ACC_PCT_DEF", 50)))):
+                ("accel [% of MOVE]", "acc", D.get("C_TELE_ACC_PCT_DEF", 50)),
+                ("tremor band [cdeg]", "tremor", D.get("C_TELE_TREMOR_DEF", 100)))):
             ttk.Label(box, text=lbl, width=22, anchor="e").grid(
                 row=i, column=0, sticky="e", padx=6, pady=2)
             v = tk.StringVar(value=str(default))
             ttk.Entry(box, textvariable=v, width=10).grid(row=i, column=1, sticky="w")
             self.sp[key] = v
         ttk.Button(box, text="Apply", command=self.apply_speeds).grid(
-            row=0, column=2, rowspan=3, padx=10)
+            row=0, column=2, rowspan=4, padx=10)
 
-        self.wall_var = tk.BooleanVar(value=False)
+        self.wall_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(box, text="virtual wall on the insertion axis "
                                   "(enables force output)",
                         variable=self.wall_var,
                         command=self.toggle_wall).grid(
-            row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 2))
+            row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 2))
 
         # ---- buttons ----------------------------------------------------
         bar = ttk.Frame(root)
@@ -428,7 +453,7 @@ class App:
     def apply_speeds(self):
         try:
             vals = (int(self.sp["vr"].get()), int(self.sp["vt"].get()),
-                    int(self.sp["acc"].get()))
+                    int(self.sp["acc"].get()), int(self.sp["tremor"].get()))
         except ValueError:
             self.note.config(text="follow speeds must be whole numbers")
             return
@@ -472,7 +497,7 @@ class App:
                  if rigclamp & b]
         v["clutch"].set(
             f"{'ROT' if s['rot'] else '---'} {'TRA' if s['tra'] else '---'}"
-            f"   enable {s['enable']}"
+            f"   enable {s['enable']}   tremor {s['tremor']/100:.2f} deg"
             + (f"   rig clamping {' '.join(names)}" if names else ""))
 
         colour = {1: "#2e7d32", 2: "#f9a825", 4: "#b00020"}.get(s["led"], "grey30")

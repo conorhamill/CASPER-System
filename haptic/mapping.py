@@ -57,7 +57,12 @@ class MapConfig:
     psi_limit_deg:     float = 30.0
     phi_limit_deg:     float = 30.0
     theta_n_limit_deg: float = 45.0
-    tool_limit_mm:     float = 20.0
+    tool_limit_mm:     float = 15.0
+
+    # Tremor band for the three angles, in degrees. A hand holding a stylus
+    # still is not still. Comes from USR_TELE_TREMOR so the panel can change
+    # it live. Zero disables it.
+    tremor_deg: float = 1.0
 
     # Which body axis of the stylus points out of the tip, in the stylus
     # frame. VERIFY THIS ON THE BENCH - run stage0.py --axes, hold the
@@ -95,6 +100,7 @@ class MapConfig:
             psi_limit_deg = define("LIM_PSI_CDEG") / 100.0,
             phi_limit_deg = define("LIM_PHI_CDEG") / 100.0,
             tool_limit_mm = define("LIM_TOOL_MM100") / 100.0,
+            tremor_deg    = define("C_TELE_TREMOR_DEF") / 100.0,
         )
         fields.update(overrides)
         return cls(**fields)
@@ -135,6 +141,30 @@ def scale_rotation(R: np.ndarray, factor: float) -> np.ndarray:
     that happens to agree near zero.
     """
     return Rotation.from_rotvec(Rotation.from_matrix(R).as_rotvec() * factor).as_matrix()
+
+
+def drag_band(demand: float, held: float, band: float) -> float:
+    """Hysteresis band, for suppressing hand tremor.
+
+    Nothing within `band` of the held value moves it at all - which is what
+    stops the rig buzzing while somebody holds the stylus still.
+
+    >>> IT DRAGS. IT DOES NOT STEP. <<<
+
+    Once the demand escapes the band the held value is pulled along behind
+    it, staying exactly `band` away. A plain deadband would instead sit
+    still and then jump by a whole band the moment it broke, so a 1 deg
+    band would mean 1 deg steps - worse than the tremor it was fixing. The
+    cost of dragging is a permanent lag of one band in the direction of
+    travel, and two bands of dead zone when reversing.
+    """
+    if band <= 0.0:
+        return demand
+    if demand - held > band:
+        return demand - band
+    if held - demand > band:
+        return demand + band
+    return held
 
 
 def _clamp(value: float, limit: float, name: str, hit: list) -> float:
@@ -238,6 +268,15 @@ class PoseMap:
             dR = scale_rotation(R @ self._R0.T, 1.0 / cfg.angle_ratio)
             target = dR @ matrix_from_euler_xyz_deg(*self._pose0)
             (psi, phi, theta_n), locked = euler_xyz_deg(target)
+
+            # Tremor first, fence second. The other way round, a hand
+            # resting against the fence would have its jitter clamped to
+            # the limit and then let straight through as movement.
+            band    = cfg.tremor_deg
+            psi     = drag_band(psi,     self.pose_deg[0], band)
+            phi     = drag_band(phi,     self.pose_deg[1], band)
+            theta_n = drag_band(theta_n, self.pose_deg[2], band)
+
             psi     = _clamp(psi,     cfg.psi_limit_deg,     "psi",     hit)
             phi     = _clamp(phi,     cfg.phi_limit_deg,     "phi",     hit)
             theta_n = _clamp(theta_n, cfg.theta_n_limit_deg, "theta_n", hit)

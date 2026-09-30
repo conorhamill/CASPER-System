@@ -240,8 +240,8 @@
 //
 // >>> NO LONGER WIDE. THIS IS THE RAIL'S ACTUAL TRAVEL. <<<
 //
-// 2026-09-30: set to the measured travel of the rail the cable runs on,
-// which is about 20 mm each way. It was 20000 - ten times too big - and
+// 2026-09-30: set to the travel of the rail the cable runs on. It was
+// 20000 - more than ten times too big - and
 // that was survivable only while every tool command came from a human
 // typing into the panel. Under HAPTIC STREAMING the operator accumulates
 // travel with no force feedback from the rig, so a fence at a figure the
@@ -251,7 +251,7 @@
 // The tilt compensation is NOT counted here - it is added downstream in
 // InverseKinematics1T and holds the rail still through a tilt, so this
 // bounds the tool COMMAND on its own. See 3R1T_Kin_1T.mh.
-#define LIM_TOOL_MM100		2000		// +/- 20.00 mm - the rail's travel
+#define LIM_TOOL_MM100		1500		// +/- 15.00 mm - the rail's travel
 
 
 ///////////////////////////////////////////////////////////////////////////
@@ -292,7 +292,22 @@
 #define USR_TELE_VEL_ROT	16	// follow speed, angles [cdeg/s]
 #define USR_TELE_VEL_TOOL	17	// follow speed, tool   [0.01 mm/s]
 #define USR_TELE_ACC_SCALE	18	// accel as a percentage of the move accel
-#define USR_TELE_SPARE		19	// reserved, so the block stays contiguous
+
+// >>> THE TREMOR BAND. SET IT FROM THE PANEL. <<<
+//
+// A hand holding a stylus still is not still. Below this much movement
+// the pose does not follow at all, which is the difference between the
+// rig sitting quietly and the rig buzzing.
+//
+// It is APPLIED ON THE PC, not here. The PC reads this slot and filters
+// before it writes USR_TGT_*, so the targets in slots 10-13 arrive
+// already smooth and everything downstream of them - the panel boxes, the
+// interrupt, the drives - sees the clean figure. Filtering it at this end
+// would leave the panel's own command boxes jittering and look like the
+// setting had done nothing.
+//
+// In CENTIDEGREES, so 100 is one degree. Applies to psi, phi and theta_n.
+#define USR_TELE_TREMOR		19	// tremor band [cdeg]
 
 // --- sensors, straight off CAN2 -----------------------------------------
 #define USR_THETA1			20	// arm 1 joint angle, IMU  [cdeg]
@@ -956,17 +971,18 @@
 // PC is only producing new poses every 10 ms anyway.
 #define C_TELE_RETARGET_MS	20
 
-// Below this, a change in the demand is not worth a new move. Stops hand
-// tremor and the last digit of IMU noise from re-kicking the profile
-// generator hundreds of times a second.
+// Below this, a change in the demand is not worth a new move. This is NOT
+// the tremor band - that is USR_TELE_TREMOR and it lives on the PC. This
+// is only a floor, so a client that streams the same pose with the last
+// digit rattling cannot re-kick the profile generator on every pass.
 #define C_TELE_DEADBAND_CDEG	3	// 0.03 deg
 #define C_TELE_DEADBAND_TOOL	2	// 0.02 mm
 
-// Defaults for the tunables in slots 16-18, applied at boot. Deliberately
-// SLOWER than the MOVE defaults: a hand moves faster than a needle should.
-#define C_TELE_VEL_ROT_DEF	400		// [cdeg/s]     4 deg/s
-#define C_TELE_VEL_TOOL_DEF	300		// [0.01 mm/s]  3 mm/s
+// Defaults for the tunables in slots 16-19, applied at boot.
+#define C_TELE_VEL_ROT_DEF	800		// [cdeg/s]     8 deg/s
+#define C_TELE_VEL_TOOL_DEF	600		// [0.01 mm/s]  6 mm/s
 #define C_TELE_ACC_PCT_DEF	50		// % of the MOVE acceleration
+#define C_TELE_TREMOR_DEF	100		// [cdeg]       1.00 deg
 
 ///////////////////////////////////////////////////////////////////////////
 // SECTION 8 - STATUS MESSAGES

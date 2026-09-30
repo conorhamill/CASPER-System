@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from mapping import (MapConfig, PoseMap, euler_xyz_deg,
+from mapping import (MapConfig, PoseMap, drag_band, euler_xyz_deg,
                      matrix_from_euler_xyz_deg, scale_rotation)
 
 
@@ -86,7 +86,8 @@ def test_euler_scaling_would_be_wrong():
 
 # --------------------------------------------------------- rotation clutch
 def test_rotation_clutch_scales():
-    m = PoseMap(MapConfig(angle_ratio=2.0))
+    # tremor off: this is about the ratio, and the band is tested below.
+    m = PoseMap(MapConfig(angle_ratio=2.0, tremor_deg=0.0))
     m.engage_rotation(FakeSample())
     cmd = m.update(FakeSample(rotation=_turn(20, [1, 0, 0])))
     check("20 deg of wrist roll at 2:1 gives 10 deg of psi",
@@ -107,7 +108,7 @@ def test_rotation_engage_never_steps():
 
 
 def test_rotation_released_holds():
-    m = PoseMap()
+    m = PoseMap(MapConfig(tremor_deg=0.0))
     m.engage_rotation(FakeSample())
     m.update(FakeSample(rotation=_turn(20, [1, 0, 0])))
     m.release_rotation()
@@ -164,7 +165,7 @@ def test_wall_position_tracks_tool():
 # ------------------------------------------------------------ independence
 def test_clutches_are_independent():
     """The point of two buttons: aim without inserting, insert without re-aiming."""
-    m = PoseMap(MapConfig(angle_ratio=2.0, tool_ratio=3.0))
+    m = PoseMap(MapConfig(angle_ratio=2.0, tool_ratio=3.0, tremor_deg=0.0))
 
     m.engage_rotation(FakeSample())
     cmd = m.update(FakeSample(rotation=_turn(20, [1, 0, 0]), position=[0, 0, -60]))
@@ -190,6 +191,63 @@ def test_neither_clutch_holds_everything():
           and not cmd.rot_engaged and not cmd.trans_engaged)
 
 
+# ------------------------------------------------------------ tremor band
+def test_drag_band_ignores_small_movement():
+    for demand in (0.0, 0.4, -0.9, 1.0):
+        check(f"held still at demand {demand:+.1f} inside a 1 deg band",
+              drag_band(demand, 0.0, 1.0) == 0.0)
+
+
+def test_drag_band_drags_rather_than_steps():
+    """The reason this is not a plain deadband."""
+    held = drag_band(5.0, 0.0, 1.0)
+    check("escaping the band leaves the held value trailing by the band",
+          abs(held - 4.0) < 1e-12)
+    check("a plain deadband would have jumped the whole 5 deg", held != 5.0)
+    check("and it keeps trailing as the demand grows",
+          abs(drag_band(6.0, held, 1.0) - 5.0) < 1e-12)
+
+
+def test_drag_band_reversal_costs_two_bands():
+    held = drag_band(5.0, 0.0, 1.0)          # 4.0, trailing below
+    check("reversing within two bands does nothing",
+          drag_band(3.5, held, 1.0) == held)
+    check("past two bands it picks up on the other side",
+          abs(drag_band(2.5, held, 1.0) - 3.5) < 1e-12)
+
+
+def test_drag_band_zero_is_off():
+    check("band 0 passes the demand straight through",
+          drag_band(0.123, 99.0, 0.0) == 0.123)
+
+
+def test_tremor_suppresses_jitter_through_the_mapper():
+    cfg = MapConfig(angle_ratio=1.0, tremor_deg=1.0)
+    m = PoseMap(cfg)
+    m.engage_rotation(FakeSample())
+    # Half a degree of wobble, back and forth, is what a held hand does.
+    seen = set()
+    for deg in (0.4, -0.4, 0.3, -0.5, 0.45, -0.2):
+        seen.add(round(m.update(FakeSample(rotation=_turn(deg, [1, 0, 0]))).psi_deg, 9))
+    check(f"0.5 deg of wobble moves the command not at all ({seen})", seen == {0.0})
+    cmd = m.update(FakeSample(rotation=_turn(6.0, [1, 0, 0])))
+    check("a real 6 deg movement gets through, trailing by the band",
+          abs(cmd.psi_deg - 5.0) < 1e-6)
+
+
+def test_tremor_applied_before_the_fence():
+    """A hand resting on the fence must not have its jitter let through."""
+    cfg = MapConfig(angle_ratio=1.0, tremor_deg=1.0, psi_limit_deg=30.0)
+    m = PoseMap(cfg)
+    m.engage_rotation(FakeSample())
+    m.update(FakeSample(rotation=_turn(60.0, [1, 0, 0])))      # hard on the fence
+    at_fence = m.pose_deg[0]
+    check("sitting on the fence", abs(at_fence - 30.0) < 1e-9)
+    still = m.update(FakeSample(rotation=_turn(59.6, [1, 0, 0]))).psi_deg
+    check("jitter while against the fence does not move the command",
+          abs(still - at_fence) < 1e-9)
+
+
 def test_clamping():
     cfg = MapConfig(angle_ratio=1.0, tool_ratio=1.0, tool_limit_mm=20.0)
     m = PoseMap(cfg)
@@ -211,6 +269,12 @@ if __name__ == "__main__":
                test_translation_is_signed, test_sideways_motion_is_ignored,
                test_pointing_axis_stays_latched, test_wall_position_tracks_tool,
                test_clutches_are_independent, test_neither_clutch_holds_everything,
+               test_drag_band_ignores_small_movement,
+               test_drag_band_drags_rather_than_steps,
+               test_drag_band_reversal_costs_two_bands,
+               test_drag_band_zero_is_off,
+               test_tremor_suppresses_jitter_through_the_mapper,
+               test_tremor_applied_before_the_fence,
                test_clamping]:
         print(f"\n  {fn.__name__}")
         fn()
