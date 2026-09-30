@@ -237,7 +237,21 @@
 // There are no limit switches on the stage, so nothing downstream of this
 // will stop a large tool command. Set it to whatever you want enforced,
 // or leave it wide.
-#define LIM_TOOL_MM100		20000		// +/- 200.00 mm - effectively off
+//
+// >>> NO LONGER WIDE. THIS IS THE RAIL'S ACTUAL TRAVEL. <<<
+//
+// 2026-09-30: set to the measured travel of the rail the cable runs on,
+// which is about 20 mm each way. It was 20000 - ten times too big - and
+// that was survivable only while every tool command came from a human
+// typing into the panel. Under HAPTIC STREAMING the operator accumulates
+// travel with no force feedback from the rig, so a fence at a figure the
+// mechanism cannot reach protects nothing and the carriage finds its hard
+// stop instead.
+//
+// The tilt compensation is NOT counted here - it is added downstream in
+// InverseKinematics1T and holds the rail still through a tilt, so this
+// bounds the tool COMMAND on its own. See 3R1T_Kin_1T.mh.
+#define LIM_TOOL_MM100		2000		// +/- 20.00 mm - the rail's travel
 
 
 ///////////////////////////////////////////////////////////////////////////
