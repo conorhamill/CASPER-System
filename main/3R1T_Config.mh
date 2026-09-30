@@ -1043,9 +1043,14 @@
 #define MSG_CAN_RESET		56	// "CAN receivers re-armed"
 
 // --- teleoperation ------------------------------------------------------
-// >>> ADD THESE TO TableOfMessages IN 3R1T_traj_panel.zbm TOO. <<<
-// Same numbers. A code with no table entry shows blank on the panel, so a
-// missing one is quiet rather than wrong - but quiet is still no use.
+// Nothing to add to the panel for these: 3R1T_traj_panel.zbm carries no
+// Table or Message element on purpose - see the note at the top of it -
+// so USR_MSG is only ever a number there. The words for these codes are
+// in the print() beside each Say(), and in the haptic GUI, which reads the
+// slot over Ethernet and does its own lookup.
+//
+// The note above about TableOfMessages describes an older panel and no
+// longer applies to the one in this repo.
 #define MSG_TELE_ENTER		66	// "TELEOP: hold the enable to take control"
 #define MSG_TELE_FOLLOW		67	// "TELEOP: following the haptic device"
 #define MSG_TELE_RELEASE	68	// "TELEOP: enable released - pose held"
