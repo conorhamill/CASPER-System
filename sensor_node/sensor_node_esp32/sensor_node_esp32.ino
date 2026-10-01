@@ -1,37 +1,31 @@
 // ---------------------------------------------------------------
-// sensor_node_esp32.ino  (fable/sensor_node)
+// sensor_node_esp32.ino        CASPER-System / sensor_node
 //
-// ONE common sensor node for fable/3R, fable/1T and fable/3R1T.
-// 3R uses the limb + platform frames, 1T uses the encoder frames,
-// 3R1T uses all of them. Flash this once and leave it.
+// Sensor node for the QUB 3R1T rig: three limb joint angles, the
+// platform orientation, and the translation-stage encoder, all sent to
+// the MasterMACS on CAN2.
 //
-// Sensor node for the 3R1T rig: three limb joint angles, the platform
-// orientation, and the translation-stage encoder, all on CAN2.
+// All the sensor maths happens here, not on the MACS. The MACS receives
+// finished numbers in the units its kinematics wants, so its 2 ms ISR
+// spends its budget on the inverse kinematics rather than on quaternions.
 //
-// All the sensor maths happens here, not on the MasterMACS. The MACS
-// gets finished numbers in the units its kinematics wants, so its 2 ms
-// ISR spends its budget on the IK, not on quaternions.
+// Madgwick filters update at 100 Hz; frames go out at 50 Hz (sendHz).
 //
 // ---------------- IMU mapping (AS WIRED) --------------------------
-//   mux ch0 -> LIMB 1     home   0.00 deg
-//   mux ch1 -> PLATFORM   XYZ intrinsic Euler
-//   mux ch2 -> LIMB 2     home 240.00 deg
-//   mux ch3 -> LIMB 3     home 120.00 deg
+//   mux ch0 -> LIMB 1        mux ch2 -> LIMB 2
+//   mux ch1 -> PLATFORM      mux ch3 -> LIMB 3
 //
-// Confirmed on the bench: moving a limb by hand moves the matching
-// theta. An earlier build had ch0 and ch3 the other way round, which
-// showed up as "move limb 1, arm 3 responds".
+// Bench-confirmed: moving a limb by hand moves the matching theta.
 //
-// >>> The CAN frame is ARM-ORDERED, not channel-ordered. <<<
+// The limbs' HOME ANGLES are not here. They are a MACS concern -
+// HOME_ARM1/2/3_CDEG in main/3R1T_Config.mh - and this sketch does not
+// use them. They are deliberately not repeated, because a copy here
+// only ever goes stale.
+//
+// >>> The CAN frames are ARM-ORDERED, not channel-ordered. <<<
 // theta1 IS arm 1, theta2 IS arm 2, theta3 IS arm 3. The channel
-// shuffle is done here, once, in ARM_CHANNEL below - so the MACS side
-// needs no crossover and nothing downstream has to remember the loom.
-//
-// This differs from the older fable/homing build, where theta1 meant
-// mux channel 0 and the MACS undid the shuffle with
-// HOMING_SRC_ARM1 = theta3. If you flash this sketch, that programme's
-// HOMING_SRC_* defines must be changed to the straight-through
-// mapping or arm 1 and arm 3 will be swapped.
+// shuffle happens once, in ARM_CHANNEL below, so nothing downstream has
+// to know the loom.
 //
 // ---------------- Wiring (ESP32 DevKit) --------------------------
 //   3V3 -> mux VIN, each IMU VCC, transceiver VCC
@@ -46,19 +40,30 @@
 // on 3.3 V. 5 V on these pins will damage the ESP32.
 //
 // ---------------- Frames (8 bytes, little-endian) ----------------
-//   0x6E4  limb joint angles   (UNCHANGED from the homing build)
-//     0-1 theta1 uint16 [cdeg 0..35999]   (arm 3)
-//     2-3 theta2 uint16                   (arm 2)
-//     4-5 theta3 uint16                   (arm 1)
-//     6   status bit0/1/2 = IMU 1/2/3 ok, bit3 cal done, bit4 converged
-//     7   seq
+//   The limb angles are CONTINUOUS and SIGNED. thetaTrack() unwraps them
+//   through the 360/0 seam and accumulates, so a limb turning past 360
+//   keeps counting and one sitting at its home angle reads a steady
+//   figure instead of flicking between 0 and 360. That is what lets the
+//   MACS average and difference them, and it is why they are int32
+//   across two frames rather than uint16 in one.
+//
+//   0x6E4  limb joint angles 1 and 2
+//     0-3 theta1 int32 [cdeg]   continuous, signed   (arm 1)
+//     4-7 theta2 int32 [cdeg]                        (arm 2)
+//
+//   0x6E5  limb joint angle 3, and the status for all three
+//     0-3 theta3 int32 [cdeg]                        (arm 3)
+//     4   status bit0/1/2 = IMU 1/2/3 ok, bit3 cal done, bit4 converged
+//     5   seq
+//     6-7 unused, zero
 //
 //   0x6E8  platform orientation, XYZ intrinsic Euler
 //     0-1 eulerX int16 [cdeg]   rotation about X   (gravity referenced)
 //     2-3 eulerY int16 [cdeg]   then about new Y   (gravity referenced)
 //     4-5 eulerZ int16 [cdeg]   then about new Z   (SEE THE YAW WARNING)
 //     6   status bit0 platform IMU ok, bit1 magnetometer present,
-//                bit2 yaw datum set, bit3 converged
+//                bit2 yaw datum set (always 0 - see the yaw warning),
+//                bit3 converged
 //     7   seq
 //
 //   0x6E9  translation stage, live
@@ -72,31 +77,34 @@
 //   0x6EA  translation stage, reference-mark edges
 //     0-3 position of the last REF rising edge  int32 [um]
 //     4-7 position of the last REF falling edge int32 [um]
-//     Both are latched by the ESP32 at edge time, so the MACS gets
-//     the mark's true extent without having to poll fast enough to
-//     catch it. Homing takes the midpoint of these two.
+//     Each edge latches the ENCODER COUNT inside the REF interrupt, so
+//     both positions are exact whatever speed the stage crossed at, and
+//     the MACS gets the mark's true extent without polling fast enough
+//     to catch it. Stage homing takes the first NEW edge after it has
+//     reversed off the end of travel as its datum.
 //
 // ---------------- YAW WARNING ------------------------------------
 // This is a 6-DOF filter: accelerometer + gyro. Roll and pitch are
 // referenced to gravity and hold indefinitely. YAW (eulerZ) HAS NO
 // ABSOLUTE REFERENCE - it starts wherever the platform happened to be
-// and drifts with gyro bias, typically a few degrees per minute.
+// at power-up and drifts with gyro bias, a few degrees per minute.
 //
-// Two ways to make it usable, in order of preference:
-//   1. Zero it at a known pose ('y' command, or the panel button) and
-//      re-zero whenever you re-home. Good for minutes, not hours.
-//   2. Use the AK8963 magnetometer for an absolute heading. The board
-//      reports whether one is present (status bit1). That needs a
-//      9-DOF filter and a magnetic survey of the rig - see the
-//      MPU-9250/magnet_mapping tooling.
-// Until one of those is done, treat eulerZ as relative, not absolute.
+// >>> AND THERE IS NOTHING ON THE RIG THAT CAN DATUM IT. <<<
 //
-// ---------------- Commands (115200 8N1) --------------------------
-//   h  help              c  recalibrate gyro bias (keep rig still)
-//   y  zero the platform yaw datum here
-//   z  zero the encoder here      s <um> encoder microns per count
-//   f <hz> send rate 1..100       b <bps> bitrate
-//   p  1 Hz status print on/off
+// eulerZ is therefore ALWAYS relative, and the "yaw datum set" status
+// bit always reads 0. An absolute heading needs the AK8963 magnetometer
+// (status bit1 says whether one is fitted), a 9-DOF filter and a
+// magnetic survey of the rig. Until that exists, do not use eulerZ for
+// anything that has to be right after a few minutes.
+//
+// ---------------- Serial (115200 8N1) ----------------------------
+// Output only - there is no command interface. The sketch prints a
+// one-line status at 1 Hz, and a CAN diagnosis at start-up.
+//
+// Everything that used to be settable at runtime is now a constant at
+// the top of this file: umPerCount, sendHz, canBitrate. Changing one
+// means reflashing, which for a calibration figure is the right way
+// round anyway.
 // ---------------------------------------------------------------
 
 #include <Wire.h>
@@ -163,7 +171,17 @@ int32_t encZero    = 0;
 // wide, so the MACS would reject the pass and drive straight past it.
 volatile bool     refRisePending = false;
 volatile bool     refFallPending = false;
-volatile uint32_t refRiseUs = 0, refFallUs = 0;
+// >>> THE COUNT IS LATCHED IN THE INTERRUPT, NOT BACK-DATED. <<<
+//
+// This used to stamp micros() at each edge and, in the main loop, subtract
+// velocity x age to work out where the stage had been. That is only as
+// good as the speed estimate, and the speed estimate is a 20 ms difference
+// - so a mark crossed while accelerating measured wrong, and the error was
+// invisible because it looked like a plausible number.
+//
+// Now the encoder count itself is latched in the ISR. No estimate, no age,
+// nothing to be wrong about.
+volatile int32_t  refRiseCount = 0, refFallCount = 0;
 int32_t  refRiseUm = 0, refFallUm = 0;
 bool     refSeen   = false;
 bool     refLevel  = false;
@@ -177,6 +195,7 @@ uint32_t refPasses = 0;
 #define CAN_TX_PIN    GPIO_NUM_4
 #define CAN_RX_PIN    GPIO_NUM_5
 #define CAN_ID_THETA  0x6E4
+#define CAN_ID_THETA2 0x6E5
 #define CAN_ID_PLAT   0x6E8
 #define CAN_ID_TRANS  0x6E9
 #define CAN_ID_REF    0x6EA
@@ -204,11 +223,16 @@ const int      CAL_SAMPLES    = 200;
 // most that much. If you need better than that, re-run the axis
 // determination per limb - do not just shuffle these.
 const float NHATS[3][3] = {
-  { -0.700f, -0.714f, -0.013f },   // arm 1  (mux ch0)
-  { -0.717f, -0.697f, -0.001f },   // arm 2  (mux ch2)
-  { -0.707f, -0.706f, -0.027f },   // arm 3  (mux ch3)
+  { -0.714470f, -0.699659f, -0.003254f },   // arm 1  (mux ch0)
+  { -0.709939f, -0.704257f, -0.003017f },   // arm 2  (mux ch2)
+  { -0.705921f, -0.708282f, -0.003464f },   // arm 3  (mux ch3)
 };
-const float THETA_OFFSETS[3] = { 180.0f, 180.0f, 180.0f };
+
+// theta_off = 180 deg + delta_i. The 180 puts home near zero; delta_i is
+// the per-limb trim and is ZERO until somebody measures it on the rig.
+// Keep them separate: the 180 is geometry, the deltas are calibration, and
+// folding them into one number loses which is which.
+const float THETA_DELTAS[3] = { 0.0f, 0.0f, 0.0f };
 
 // ---------------- State ------------------------------------------
 struct ImuState {
@@ -220,6 +244,14 @@ struct ImuState {
 };
 ImuState imu[NUM_IMUS];
 
+// Continuity trackers, indexed by ARM-1 like everything else on this side.
+// Both start at zero: see thetaTrack().
+float thetaPrev[3]   = {0.0f, 0.0f, 0.0f};   // last 0..360 reading
+float thetaActual[3] = {0.0f, 0.0f, 0.0f};   // continuous, signed [deg]
+// Until a limb is seeded its theta reads 0 and means nothing. The MACS is
+// told via the converged bit in the status byte, and refuses to home on it.
+bool  thetaSeeded[3] = {false, false, false};
+
 float platEuler[3] = {0, 0, 0};    // XYZ intrinsic [deg]
 float yawDatum = 0.0f;
 bool  yawDatumSet = false;
@@ -228,9 +260,6 @@ bool     muxOk = false, calDone = false, converged = false;
 uint8_t  seq = 0;
 uint32_t loopCount = 0;
 uint32_t nextSampleUs = 0, nextSendUs = 0, lastStatusMs = 0;
-
-char    cmdBuf[32];
-uint8_t cmdLen = 0;
 
 // =================================================================
 // Vector helpers
@@ -351,6 +380,15 @@ static void madgwickUpdate(float q[4], float gx, float gy, float gz,
   q[0] = q0 / n; q[1] = q1 / n; q[2] = q2 / n; q[3] = q3 / n;
 }
 
+// Single-revolution limb angle, 0..360, from gravity in the body frame
+// projected onto the rotation plane.
+//
+// >>> THE atan2 IS NEGATED. <<<
+//
+// Without the minus sign theta counts the wrong way round the limb axis.
+// With it, theta increases with ANTICLOCKWISE rotation - the right-hand
+// rule about n_hat - which is the direction the homing signs d_i and the
+// kinematics both assume. This is the change that flips d_i from -1 to +1.
 static float computeTheta(const float q[4], const float e1[3],
                           const float e2[3], float offsetDeg) {
   float gB[3] = {
@@ -358,10 +396,60 @@ static float computeTheta(const float q[4], const float e1[3],
     2.0f * (q[0] * q[1] + q[2] * q[3]),
     2.0f * (0.5f - q[1] * q[1] - q[2] * q[2]),
   };
-  float t = atan2f(vecDot(gB, e2), vecDot(gB, e1)) * 180.0f / PI + offsetDeg;
+  float p = vecDot(gB, e1);
+  float s = vecDot(gB, e2);
+  float t = -atan2f(s, p) * 180.0f / PI + offsetDeg;
   t = fmodf(t, 360.0f);
   if (t < 0.0f) t += 360.0f;
   return t;
+}
+
+// Unwrap a 0..360 reading into a continuous signed angle.
+//
+// >>> THIS IS WHY theta CAN BE SENT AS A SIGNED int32 AND NOT A uint16. <<<
+//
+// The single-revolution value jumps 360 -> 0 as the limb turns, and any
+// consumer that averages, differences or drives a motor from it gets a
+// spike there. Accumulating the WRAPPED delta instead gives an angle that
+// is continuous through the seam.
+//
+// >>> NOTHING IS TRACKED UNTIL THE FILTER HAS CONVERGED. <<<
+//
+// Each Madgwick filter starts at the identity quaternion, where gravity in
+// the body frame is (0,0,1). Since e1 is always perpendicular to z, p is
+// exactly zero there and s is almost exactly -1 - so the very first sample
+// reads 270 degrees on EVERY limb, whatever it is really at. The filter
+// then takes about 1.5 s to swing round to the truth.
+//
+// Tracking that swing is what put the angles on the wrong revolution: the
+// first step wrapped 270 down to -90, and then the convergence walk was
+// integrated on top, so a limb at 120 came out as -240 and one at 240 as
+// -120. Correct modulo 360, and useless to read.
+//
+// So: wait for the filter, then SEED from the reading rather than from
+// zero. Seeding on the first sample instead would not help - the walk is
+// the problem, not the starting value.
+//
+// What that makes theta: within 0..360 at the moment of seeding, and
+// continuous from then on. Gravity cannot tell you more than that - a limb
+// physically at 480 degrees reads 120 and nothing can know otherwise - so
+// this is an angle plus however far it has turned since, never an absolute
+// multi-turn position across a power cycle.
+static void thetaTrack(int limb, float thetaNew) {
+  if (!converged) return;
+
+  if (!thetaSeeded[limb]) {
+    thetaPrev[limb]   = thetaNew;
+    thetaActual[limb] = thetaNew;
+    thetaSeeded[limb] = true;
+    return;
+  }
+
+  float d = thetaNew - thetaPrev[limb];
+  if (d >=  180.0f) d -= 360.0f;
+  if (d <= -180.0f) d += 360.0f;
+  thetaActual[limb] += d;
+  thetaPrev[limb]    = thetaNew;
 }
 
 // XYZ INTRINSIC Euler angles from the quaternion.
@@ -432,7 +520,13 @@ static void calibrateGyro() {
     }
   }
   calDone = true;
+  // The filter has to swing round again, so the trackers must re-seed
+  // afterwards. Resuming from a stale thetaPrev would integrate that
+  // swing and put the angles back on the wrong revolution.
   converged = false;
+  thetaSeeded[0] = false;
+  thetaSeeded[1] = false;
+  thetaSeeded[2] = false;
   loopCount = 0;
   Serial.println("OK,gyro calibration done");
 }
@@ -445,24 +539,27 @@ static inline int IRAM_ATTR fastRead(gpio_num_t pin) {
   return (REG_READ(GPIO_IN1_REG) >> (pin - 32)) & 1;
 }
 
-// Both edges, each into its own slot so neither can overwrite the other.
-static void IRAM_ATTR refIsr() {
-  if (fastRead(ENC_REF_PIN)) {
-    refRiseUs = micros();
-    refRisePending = true;
-  } else {
-    refFallUs = micros();
-    refFallPending = true;
-  }
-}
-
 static bool IRAM_ATTR onPcntReach(pcnt_unit_handle_t u,
                                   const pcnt_watch_event_data_t *e, void *ctx) {
   pcntAccum += e->watch_point_value;
   return false;
 }
 
-static int32_t encRead() {
+// The count, as the sum of the hardware counter and the overflow
+// accumulator.
+//
+// >>> THOSE TWO HALVES CAN MOVE BETWEEN THE READS. <<<
+//
+// A PCNT overflow fires onPcntReach, which adds a whole PCNT_HIGH to the
+// accumulator at the same moment the hardware count snaps back towards
+// zero. Read them in the wrong order across that event and the answer is
+// out by 16384 counts - about 1.6 mm - which is a plausible-looking number
+// and therefore the worst kind of wrong.
+//
+// So: read the accumulator, read the hardware, read the accumulator again.
+// If it did not move, the pair is consistent. Three tries is generous -
+// overflows are ~16384 counts apart and this loop is a few microseconds.
+static inline int32_t IRAM_ATTR encCountNow() {
   for (int t = 0; t < 3; t++) {
     int32_t before = pcntAccum;
     int raw = 0;
@@ -472,6 +569,23 @@ static int32_t encRead() {
   int raw = 0;
   pcnt_unit_get_count(pcntUnit, &raw);
   return pcntAccum + raw;
+}
+
+static int32_t encRead() {
+  return encCountNow();
+}
+
+// Both edges, each into its own slot so neither can overwrite the other,
+// and each latching the COUNT at the instant of the edge.
+static void IRAM_ATTR refIsr() {
+  int32_t c = encCountNow();
+  if (fastRead(ENC_REF_PIN)) {
+    refRiseCount   = c;
+    refRisePending = true;
+  } else {
+    refFallCount   = c;
+    refFallPending = true;
+  }
 }
 
 static bool pcntSetup() {
@@ -644,19 +758,28 @@ static void canSend(uint32_t id, const uint8_t *d) {
 static void sendAll(int32_t encCount, float velMmS) {
   uint8_t d[8];
 
-  // ---- 0x6E4 limb angles, ARM-ORDERED: theta1=arm1, 2=arm2, 3=arm3 ----
-  for (int a = 0; a < 3; a++) {
-    int ch = ARM_CHANNEL[a];
-    uint16_t cdeg = (uint16_t)((int32_t)lroundf(imu[ch].theta * 100.0f) % 36000);
-    putU16(d, 2 * a, cdeg);
-  }
+  // ---- limb angles, ARM-ORDERED: theta1=arm1, 2=arm2, 3=arm3 ----------
+  // Continuous and signed, straight out of the trackers. No modulo: the
+  // whole point of thetaActual is that it does NOT wrap.
   uint8_t st = 0;
   for (int a = 0; a < 3; a++) if (imu[ARM_CHANNEL[a]].ok) st |= (1 << a);
   if (calDone)   st |= 0x08;
   if (converged) st |= 0x10;
-  d[6] = st;
-  d[7] = seq;
+
+  // 0x6E4 - theta1 and theta2, four bytes each, filling the frame.
+  putI32(d, 0, (int32_t)lroundf(thetaActual[0] * 100.0f));
+  putI32(d, 4, (int32_t)lroundf(thetaActual[1] * 100.0f));
   canSend(CAN_ID_THETA, d);
+
+  // 0x6E5 - theta3, then the status and sequence for all three. The
+  // status rides with theta3 rather than with the pair so that a MACS
+  // which has seen 0x6E5 knows every angle in the set is accounted for.
+  putI32(d, 0, (int32_t)lroundf(thetaActual[2] * 100.0f));
+  d[4] = st;
+  d[5] = seq;
+  d[6] = 0;
+  d[7] = 0;
+  canSend(CAN_ID_THETA2, d);
 
   // ---- 0x6E8 platform orientation ----
   float yaw = platEuler[2] - (yawDatumSet ? yawDatum : 0.0f);
@@ -696,71 +819,6 @@ static void sendAll(int32_t encCount, float velMmS) {
   canSend(CAN_ID_REF, d);
 
   seq++;
-}
-
-// =================================================================
-// Commands
-// =================================================================
-static void printHelp() {
-  Serial.println("#,h help | c gyro cal | y zero yaw datum | z zero encoder");
-  Serial.println("#,s <um/count> | f <hz> | b <bitrate> | p status print");
-  Serial.println("#,d CAN bus diagnosis - run this when the MACS sees nothing");
-}
-
-static void handleCommand(char *line) {
-  while (*line == ' ') line++;
-  char c = *line;
-  char *arg = line + 1;
-  switch (c) {
-    case 'h': case '?': printHelp(); break;
-    case 'c': calibrateGyro(); break;
-    case 'y':
-      yawDatum = platEuler[2];
-      yawDatumSet = true;
-      Serial.printf("OK,yaw datum set at %.2f deg - this pose is now yaw 0\n", yawDatum);
-      break;
-    case 'z':
-      encZero = encRead();
-      Serial.println("OK,encoder zeroed here");
-      break;
-    case 'p':
-      statusPrint = !statusPrint;
-      Serial.printf("OK,status print %s\n", statusPrint ? "on" : "off");
-      break;
-    case 'd': canDump(); break;
-    case 's': {
-      float v = atof(arg);
-      if (v > 0.0f) { umPerCount = v; Serial.printf("OK,%.4f um/count\n", v); }
-      else Serial.println("E!,scale must be > 0");
-      break;
-    }
-    case 'f': {
-      long v = atol(arg);
-      if (v >= 1 && v <= 100) { sendHz = v; Serial.printf("OK,%ld Hz\n", v); }
-      else Serial.println("E!,rate must be 1..100 Hz");
-      break;
-    }
-    case 'b': {
-      long v = atol(arg);
-      if (v == 125000 || v == 250000 || v == 500000 || v == 800000 || v == 1000000) {
-        canBitrate = v;
-        if (canStart()) Serial.printf("OK,bitrate %ld\n", v);
-        else Serial.println("E!,CAN restart failed");
-      } else Serial.println("E!,bad bitrate");
-      break;
-    }
-    case '\0': break;
-    default: Serial.printf("E!,unknown command '%c' (h for help)\n", c);
-  }
-}
-
-static void pollSerial() {
-  while (Serial.available()) {
-    char ch = (char)Serial.read();
-    if (ch == '\r') continue;
-    if (ch == '\n') { cmdBuf[cmdLen] = '\0'; handleCommand(cmdBuf); cmdLen = 0; }
-    else if (cmdLen < sizeof(cmdBuf) - 1) cmdBuf[cmdLen++] = ch;
-  }
 }
 
 // =================================================================
@@ -813,7 +871,7 @@ void setup() {
   calibrateGyro();
   Serial.println("#,NOTE: platform yaw has no absolute reference - press 'y' at a");
   Serial.println("#,      known pose to datum it, and expect slow drift after that.");
-  printHelp();
+  canDump();
 
   nextSampleUs = micros();
   nextSendUs   = micros();
@@ -822,7 +880,6 @@ void setup() {
 
 // =================================================================
 void loop() {
-  pollSerial();
   canService();
 
   static int32_t  lastEnc = 0;
@@ -831,27 +888,21 @@ void loop() {
 
   int32_t encCount = encRead();
 
-  // Resolve latched REF edges against the live count. Done here rather
-  // than in the ISR because the PCNT driver call is not interrupt-safe.
-  //
-  // BOTH edges are handled in the same iteration if both are pending,
-  // and each position is back-dated from its own timestamp using the
-  // current speed. Without that, two edges resolved together would land
-  // on the same position and the mark would measure as zero wide.
+  // Convert the latched edge COUNTS to microns. Both edges are handled in
+  // the same iteration if both are pending, and because each latched its
+  // own count in the ISR they keep their own positions - the mark measures
+  // its true width even when both edges are resolved together, with no
+  // speed estimate involved.
   if (refRisePending || refFallPending) {
-    int32_t  umNow = (int32_t)lroundf((encCount - encZero) * umPerCount);
-    uint32_t now   = micros();
-
     if (refRisePending) {
       refRisePending = false;
-      // velMmS [mm/s] * age [ms] == microns travelled since the edge
-      refRiseUm = umNow - (int32_t)lroundf(velMmS * ((now - refRiseUs) / 1000.0f));
+      refRiseUm = (int32_t)lroundf((refRiseCount - encZero) * umPerCount);
       refSeen   = true;
       refLevel  = true;
     }
     if (refFallPending) {
       refFallPending = false;
-      refFallUm = umNow - (int32_t)lroundf(velMmS * ((now - refFallUs) / 1000.0f));
+      refFallUm = (int32_t)lroundf((refFallCount - encZero) * umPerCount);
       if (refSeen) refPasses++;      // a complete pass: both edges valid
       refLevel  = false;
     }
@@ -876,7 +927,16 @@ void loop() {
       if (i == IDX_PLATFORM) {
         quatToEulerXYZ(imu[i].q, platEuler);
       } else {
-        imu[i].theta = computeTheta(imu[i].q, imu[i].e1, imu[i].e2, 180.0f);
+        // i is a MUX CHANNEL. The deltas and the continuity trackers are
+        // indexed by ARM, so cross over here once - the same reason
+        // ARM_CHANNEL exists at all.
+        int arm = -1;
+        for (int a = 0; a < 3; a++) if (ARM_CHANNEL[a] == i) arm = a;
+        if (arm >= 0) {
+          imu[i].theta = computeTheta(imu[i].q, imu[i].e1, imu[i].e2,
+                                      180.0f + THETA_DELTAS[arm]);
+          thetaTrack(arm, imu[i].theta);
+        }
       }
     }
   }
@@ -909,7 +969,7 @@ void loop() {
     // reading it while debugging a dead bus was reading the wrong numbers.
     Serial.printf("#,arm1=%.1f arm2=%.1f arm3=%.1f | plat %.1f %.1f %.1f | "
                   "enc %.3f mm %s passes=%lu | can %s tx=%lu fail=%lu\n",
-                  imu[ARM_CHANNEL[0]].theta, imu[ARM_CHANNEL[1]].theta, imu[ARM_CHANNEL[2]].theta,
+                  thetaActual[0], thetaActual[1], thetaActual[2],
                   platEuler[0], platEuler[1],
                   platEuler[2] - (yawDatumSet ? yawDatum : 0.0f),
                   (encCount - encZero) * umPerCount / 1000.0f,

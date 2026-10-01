@@ -81,7 +81,7 @@
 #define C_AXIS_POSFACT_N	1
 #define C_AXIS_FEEDREV		1
 #define C_AXIS_FEEDDIST		36000		// cdeg per output revolution
-#define C_AXIS_MAX_RPM		7000
+#define C_AXIS_MAX_RPM		10000	// all axes, limbs and stage alike
 #define C_AXIS_VELRES		100
 #define C_AXIS_RAMPTYPE		RAMPTYPE_JERKLIMITED
 #define C_AXIS_RAMPMIN		500
@@ -182,7 +182,8 @@
 // The cable demand is not linear in the pose, so checking only the two
 // end points can miss a bulge in the middle entirely. 32 samples costs
 // about 32 sqrt evaluations once per MOVE - nothing, next to being wrong.
-#define MOVE_PATH_SAMPLES	32
+// MOVE_PATH_SAMPLES was how finely ScanPosePath sampled a planned move.
+// Both went 2026-09-30.
 
 // At-target window for profiled moves.
 #define C_DONE_TOL_CDEG		20			// arm / EE axes  [cdeg]  0.20 deg
@@ -314,6 +315,17 @@
 #define USR_THETA2			21	// arm 2
 #define USR_THETA3			22	// arm 3
 #define USR_IMU_STATUS		23	// bit0/1/2 arm IMU ok, bit3 cal, bit4 converged
+// Masks for slot 23, so nothing has to remember which bit is which.
+// >>> CONVERGED IS THE ONE HOMING CARES ABOUT. <<<
+// Each Madgwick filter starts at the identity quaternion and takes about
+// 1.5 s to swing round to the real orientation. Until it has, the sensor
+// node has not seeded its continuity trackers and every theta reads 0 -
+// which looks exactly like three limbs sitting at zero degrees.
+#define IMU_ST_ARM1			0x01
+#define IMU_ST_ARM2			0x02
+#define IMU_ST_ARM3			0x04
+#define IMU_ST_CAL			0x08
+#define IMU_ST_CONVERGED	0x10
 #define USR_THETA_STALE		24	// 1 = no limb frame for > CAN_STALE_MS
 #define USR_PLAT_X			25	// 4th IMU, platform Euler X [cdeg]
 #define USR_PLAT_Y			26	// Y
@@ -572,16 +584,25 @@
 ///////////////////////////////////////////////////////////////////////////
 // --- 3R limbs: drive each arm until its IMU reads the home angle --------
 #define HOME_ARM1_CDEG		0		// arm 1 home angle [cdeg]
-#define HOME_ARM2_CDEG		24000	// arm 2 -> 240.00 deg
-#define HOME_ARM3_CDEG		12000	// arm 3 -> 120.00 deg
+#define HOME_ARM2_CDEG		12000	// arm 2 -> 120.00 deg
+#define HOME_ARM3_CDEG		24000	// arm 3 -> 240.00 deg
 
 // >>> Sign of the motor move for a given IMU error. <<<
-// Bench-verified 2026-07-16. Flip one of these if that arm homes the
-// wrong way - it will run away from the target instead of towards it,
-// and the pass counter will hit HOME_MAX_PASSES.
-#define HOME_DIR_ARM1		-1
-#define HOME_DIR_ARM2		-1
-#define HOME_DIR_ARM3		-1
+//
+// >>> THESE FLIPPED TO +1 AND HAVE NOT BEEN VERIFIED ON THE RIG. <<<
+//
+// The -1s were bench-verified 2026-07-16 against the OLD theta, which
+// counted the wrong way round the limb axis. computeTheta on the sensor
+// node now negates its atan2, so theta increases anticlockwise and the
+// sign of the loop gain inverts with it. +1 is therefore the EXPECTED
+// value, not a measured one.
+//
+// Get this wrong and homing does not merely fail, it DIVERGES - see the
+// runaway note below. Check it with one small move per limb before
+// trusting a full home.
+#define HOME_DIR_ARM1		1
+#define HOME_DIR_ARM2		1
+#define HOME_DIR_ARM3		1
 
 #define HOME_TOL_CDEG		100		// "close enough" window: 1.00 deg
 #define HOME_AVG_SAMPLES	16		// CAN frames averaged per measurement
@@ -648,12 +669,47 @@
 // and less detection lag in the latched edge positions. About 2.5 mm/s at
 // the drum, far above the 0.1 mm/s stall threshold below, so the end-stop
 // detector keeps its margin.
+// >>> STAGE HOMING IS NOW TWO PHASES. <<<
+//
+// PHASE A finds the END OF TRAVEL, ignoring the REF mark completely. It
+// drives in C_1T_HOME_DIR and watches for CABLE SLACK: the motor still
+// turning while the linear encoder has stopped moving. Both conditions
+// must hold together for H_SLACK_TIME_MS - the motor alone proves nothing
+// (it turns all the time) and the encoder alone proves nothing (it is also
+// still if the drive has faulted).
+//
+// This replaces judging the end stop from the linear encoder velocity
+// alone, which could not tell "wound up against the stop" from "drive not
+// running".
+//
+// PHASE B baselines the REF latches, reverses, and runs until a NEW edge
+// is latched. That latched position is the datum. The ESP32 now latches
+// the encoder COUNT inside the REF interrupt rather than back-dating from
+// a timestamp and a speed estimate, so the edge position no longer depends
+// on how fast the stage happened to be going.
+//
+// >>> EVERY THRESHOLD BELOW IS A GUESS UNTIL MEASURED ON THE RIG. <<<
+// Watch one run with g_verbose on: the print says what the motor speed and
+// the carriage movement actually were when slack was called.
+#define H_SLACK_MOTOR_UU_S	200		// motor must exceed this  [UU/s]
+#define H_SLACK_ENC_UM		200		// carriage must move less than this [um]
+#define H_SLACK_TIME_MS		400		// with both true for this long
+#define H_SLACK_ARM_MS		1000	// ignored this long after the move starts
+#define H_SLACK_TIMEOUT_MS	60000	// no slack in this long -> fail
+#define H_REF_TIMEOUT_MS	60000	// no new REF edge in this long -> fail
+#define H_REF_MAX_TRAVEL_UM	120000	// or in this much travel -> fail
+
 #define H_SEARCH_VEL		4
 #define H_TIMEOUT_MS		120000
 
 // End-stop detection. There are no limit switches, so a STALL is the end
 // stop: motor commanded to move, encoder not following. These MUST stay
 // below H_SEARCH_VEL or a genuine slow move reads as a stall.
+// >>> H_STALL_* AND H_BACKOFF_* AND H_TIMEOUT_MS ARE LEGACY. <<<
+// They belonged to the single-phase stage search - stall detection from
+// the linear encoder alone, and the end-stop back-off. Nothing reads them
+// since the two-phase sequence went in on 2026-09-30. Left here rather
+// than deleted so a bisect against an older program still compiles.
 #define H_STALL_VEL_MMS		1		// [0.1 mm/s]
 #define H_STALL_TIME_MS		600
 #define H_STALL_ARM_MS		1000
@@ -672,11 +728,13 @@
 #define H_IDLE				0
 #define H_3R_MEASURE		1
 #define H_3R_MOVE			2
-#define H_1T_SEARCH			3
-#define H_1T_BACKOFF		4
+#define H_1T_SEARCH			3	// legacy, no longer entered
+#define H_1T_BACKOFF		4	// legacy, no longer entered
 #define H_FINISH			5
 #define H_DONE				6
 #define H_FAILED			7
+#define H_1T_SLACK			8	// phase A: hunting the end of travel
+#define H_1T_REF			9	// phase B: hunting the REF edge
 
 
 ///////////////////////////////////////////////////////////////////////////
@@ -687,7 +745,13 @@
 // is no crossover here.
 ///////////////////////////////////////////////////////////////////////////
 #define CAN_BUS_OFFSET		100000	// CAN2
-#define CAN_ID_THETA		0x6E4	// limb joint angles
+// >>> THE LIMB ANGLES NOW ARRIVE AS TWO FRAMES OF SIGNED int32. <<<
+// They were three uint16 of 0..35999 in 0x6E4 alone. The sensor node
+// now unwraps them through the 360/0 seam, so they are continuous and
+// signed and no longer fit. Both sides must be flashed together: an old
+// node against this parser reads nonsense, not stale values.
+#define CAN_ID_THETA		0x6E4	// theta1, theta2  int32 cdeg
+#define CAN_ID_THETA2		0x6E5	// theta3 int32 cdeg, status, seq
 #define CAN_ID_PLAT			0x6E8	// platform Euler, 4th IMU
 #define CAN_ID_TRANS		0x6E9	// stage position / velocity
 #define CAN_ID_REF			0x6EA	// stage REF mark edges
@@ -832,7 +896,7 @@
 #define C_TRAJ_VEL_ROT_MAX	2000	// [cdeg/s]      20.00 deg/s
 #define C_TRAJ_ACC_ROT_MAX	32000	// [cdeg/s^2]
 #define C_TRAJ_VEL_TOOL_MAX	1000	// [0.01 mm/s]   10.00 mm/s
-#define C_TRAJ_ACC_TOOL_MAX	28000	// [0.01 mm/s^2]
+#define C_TRAJ_ACC_TOOL_MAX	8000	// [0.01 mm/s^2]  80.00 mm/s^2
 
 // >>> A PAUSE IS TWO STAGES, AND THESE TWO NUMBERS ARE ONE APIECE. <<<
 //
@@ -1074,5 +1138,16 @@
 #define MSG_TELE_EXIT		70	// "TELEOP: finished"
 #define MSG_TELE_NO_LINK	71	// "TELEOP refused: no heartbeat from the PC"
 #define MSG_TELE_NOT_HOMED	72	// "TELEOP refused: home the rig first"
+
+// --- stage homing, two-phase -------------------------------------------
+#define MSG_HOME_1T_SLACK	73	// "HOMING: end of travel found"
+#define MSG_HOME_1T_NOSLK	74	// "HOMING failed: never reached the end stop"
+#define MSG_HOME_1T_NOREF	75	// "HOMING failed: no REF edge on the way back"
+// >>> NOT "NO_CONV". THAT NAME IS TAKEN, AND MEANS SOMETHING ELSE. <<<
+// MSG_HOME_NO_CONV (17) is the homing RUNAWAY guard - the measure/move
+// loop diverging. This is the IMU filters not having settled yet. The two
+// read almost identically in English and are completely different faults,
+// so they get names that cannot be confused.
+#define MSG_HOME_IMU_SETTLE	76	// "HOME refused: limb IMUs still settling"
 
 #endif // _3R1T_CONFIG_MH_

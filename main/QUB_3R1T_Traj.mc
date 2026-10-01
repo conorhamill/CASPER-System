@@ -207,12 +207,14 @@ void LeaveStream(void)
 ///////////////////////////////////////////////////////////////////////////
 void CanArm(void)
 {
-	canObjTheta = DefCanIn(CAN_BUS_OFFSET + CAN_ID_THETA, 8);
+	canObjTheta  = DefCanIn(CAN_BUS_OFFSET + CAN_ID_THETA,  8);
+	canObjTheta2 = DefCanIn(CAN_BUS_OFFSET + CAN_ID_THETA2, 8);
 	canObjPlat  = DefCanIn(CAN_BUS_OFFSET + CAN_ID_PLAT,  8);
 	canObjTrans = DefCanIn(CAN_BUS_OFFSET + CAN_ID_TRANS, 8);
 	canObjRef   = DefCanIn(CAN_BUS_OFFSET + CAN_ID_REF,   8);
-	canLastRxTheta = Time();
-	canLastRxPlat  = Time();
+	canLastRxTheta  = Time();
+	canLastRxTheta2 = Time();
+	canLastRxPlat   = Time();
 	canLastRxEnc   = Time();
 	if (g_verbose) print("CAN: receivers armed  theta=",canObjTheta," plat=",canObjPlat," trans=",canObjTrans," ref=",canObjRef);
 }
@@ -222,14 +224,32 @@ void CanPoll(void)
 	long b03, b47, now;
 
 	// Valid DefCanIn handles include 0, so poll on >= 0.
+	// >>> THE LIMB ANGLES ARE SIGNED int32 NOW, ACROSS TWO FRAMES. <<<
+	//
+	// They were three uint16 of 0..35999 packed into 0x6E4. The sensor node
+	// unwraps them through the 360/0 seam, so they are continuous and
+	// signed - which is what lets homing average and difference them
+	// without a spike at the seam, and what makes theta read about zero at
+	// home instead of flicking between 0 and 360.
+	//
+	// The slots are longs and the units are still centidegrees, so nothing
+	// downstream of here changes. An OLD sensor node against this parser
+	// reads nonsense, not stale values: flash both sides together.
 	if (canObjTheta >= 0) {
 		if (CanIn(canObjTheta, -1, 0, b03, b47) == 0) {
-			USER_PARAM(USR_THETA1)     = CanU16(b03, b47, 0);
-			USER_PARAM(USR_THETA2)     = CanU16(b03, b47, 2);
-			USER_PARAM(USR_THETA3)     = CanU16(b03, b47, 4);
-			USER_PARAM(USR_IMU_STATUS) = CanBusByte(b03, b47, 6);
+			USER_PARAM(USR_THETA1) = CanI32(b03, b47, 0);
+			USER_PARAM(USR_THETA2) = CanI32(b03, b47, 4);
 			g_frames = g_frames + 1;
 			canLastRxTheta = Time();
+		}
+	}
+	// theta3 carries the status for all three, so this is the frame that
+	// completes a set.
+	if (canObjTheta2 >= 0) {
+		if (CanIn(canObjTheta2, -1, 0, b03, b47) == 0) {
+			USER_PARAM(USR_THETA3)     = CanI32(b03, b47, 0);
+			USER_PARAM(USR_IMU_STATUS) = CanBusByte(b03, b47, 4);
+			canLastRxTheta2 = Time();
 		}
 	}
 	if (canObjPlat >= 0) {
@@ -258,7 +278,10 @@ void CanPoll(void)
 	}
 
 	now = Time();
-	USER_PARAM(USR_THETA_STALE) = ((now - canLastRxTheta) > CAN_STALE_MS) ? TRUE : FALSE;
+	// Stale if EITHER limb frame has gone quiet - one without the other is
+	// an incomplete set, not a usable one.
+	USER_PARAM(USR_THETA_STALE) = (((now - canLastRxTheta)  > CAN_STALE_MS) ||
+	                               ((now - canLastRxTheta2) > CAN_STALE_MS)) ? TRUE : FALSE;
 	USER_PARAM(USR_PLAT_STALE)  = ((now - canLastRxPlat)  > CAN_STALE_MS) ? TRUE : FALSE;
 	USER_PARAM(USR_ENC_STALE)   = ((now - canLastRxEnc)   > CAN_STALE_MS) ? TRUE : FALSE;
 
@@ -363,71 +386,15 @@ long PoseAtTarget(void)
 	return(TRUE);
 }
 
-// Walk the planned move and find out what the CABLE has to do.
+// The cable-demand path scan lived here. It sampled the planned move,
+// found the largest cable step between consecutive samples, and let
+// StartPoseMove slow every axis to suit. Removed 2026-09-30 by request -
+// see the note in StartPoseMove for what that means for the stage.
 //
-// The stage does not just follow the tool box: with the coupled
-// kinematics it also pays out whatever the platform tilt swallows, and
-// that term is much the larger of the two. Checking only the start and
-// end poses would miss a bulge in the middle, because cable demand is
-// not linear in the pose - so the whole path gets sampled.
-//
-// Leaves behind the range of cable the path needs, and the biggest step
-// between two consecutive samples, which is what sets the peak speed.
-void ScanPosePath(void)
-{
-	long i;
-	double p0, h0, n0, l0;
-	double p1, h1, n1, l1;
-	double s, ps, ph, tn, tl, c, prev, d;
+// ReportCableBudget below is NOT that scan and is still wanted: it prints
+// once at boot what the tilt limits demand of the carriage, which is the
+// figure LIM_TOOL_MM100 has to be sized against.
 
-	p0 = (double)(Cpos(EE_PSI))     / 100.0;
-	h0 = (double)(Cpos(EE_PHI))     / 100.0;
-	n0 = (double)(Cpos(EE_THETA_N)) / 100.0;
-	l0 = (double)(Cpos(EE_TOOL))    / 100.0;
-	p1 = (double)(USER_PARAM(USR_TGT_PSI))     / 100.0;
-	h1 = (double)(USER_PARAM(USR_TGT_PHI))     / 100.0;
-	n1 = (double)(USER_PARAM(USR_TGT_THETA_N)) / 100.0;
-	l1 = (double)(USER_PARAM(USR_TGT_TOOL))    / 100.0;
-
-	g_path_cable_min =  1e9;
-	g_path_cable_max = -1e9;
-	g_path_seg_max   =  0;
-	prev = 0;
-
-	for (i = 0; i <= MOVE_PATH_SAMPLES; i++) {
-		s  = (double)i / (double)MOVE_PATH_SAMPLES;
-		ps = p0 + s * (p1 - p0);
-		ph = h0 + s * (h1 - h0);
-		tn = n0 + s * (n1 - n0);
-		tl = l0 + s * (l1 - l0);
-
-#if (KIN_1T_MODEL == KIN_1T_COUPLED)
-		// Same expression the ISR will evaluate, including the home
-		// offset the ISR adds - if these two ever disagree, the check
-		// is guarding a move that will not happen.
-		c = CableSpan(ps, ph, tn + IK_THETA_N_HOME_DEG) - g_L_home + tl;
-#else
-		c = tl;
-#endif
-
-		if (c < g_path_cable_min) { g_path_cable_min = c; }
-		if (c > g_path_cable_max) { g_path_cable_max = c; }
-		if (i > 0) {
-			d = c - prev;
-			if (d < 0) { d = -d; }
-			if (d > g_path_seg_max) { g_path_seg_max = d; }
-		}
-		prev = c;
-	}
-}
-
-
-// Printed once at startup: how much stage travel the configured tilt
-// limits actually demand.
-//
-// This is the number to size LIM_TOOL_MM100 against, and it is far bigger
-// than intuition suggests - the cable inlet sits 218 mm out from the
-// centre of rotation, so a degree of tilt is nearly 4 mm of arc.
 void ReportCableBudget(void)
 {
 	long a, b, c;
@@ -484,80 +451,34 @@ long PoseCommandOk(void)
 // four axes are interpolated together so they arrive at the same moment.
 void StartPoseMove(void)
 {
-	long dP, dH, dN, dT;
-	long vAng, aAng, vTool, aTool, tvmax;
-	double tmove, rate, allowed, scale;
+	long vAng, aAng, vTool, aTool;
 
-	// Walk the path to find the biggest cable step. Nothing here refuses a
-	// move - it only works out how fast the stage would have to run.
-	ScanPosePath();
-
-	// ---- how long the move would take at the requested speeds ----------
-	// AxisLinAbsStart coordinates all four axes so they arrive together,
-	// which means the whole move runs at the pace of whichever axis needs
-	// the longest.
-	vAng = USER_PARAM(USR_MOVE_VEL);
-	if (vAng < 1) { vAng = 1; }
-	vTool = USER_PARAM(USR_TOOL_VEL);
-	if (vTool < 1) { vTool = 1; }
-
-	dP = AbsL(USER_PARAM(USR_TGT_PSI)     - Cpos(EE_PSI));
-	dH = AbsL(USER_PARAM(USR_TGT_PHI)     - Cpos(EE_PHI));
-	dN = AbsL(USER_PARAM(USR_TGT_THETA_N) - Cpos(EE_THETA_N));
-	dT = AbsL(USER_PARAM(USR_TGT_TOOL)    - Cpos(EE_TOOL));
-
-	tmove = (double)dP / (double)vAng;
-	if ((double)dH / (double)vAng  > tmove) { tmove = (double)dH / (double)vAng; }
-	if ((double)dN / (double)vAng  > tmove) { tmove = (double)dN / (double)vAng; }
-	if ((double)dT / (double)vTool > tmove) { tmove = (double)dT / (double)vTool; }
-	if (tmove < 0.001) { tmove = 0.001; }
-
-	// ---- would that outrun the stage? ----------------------------------
-	// ScanPosePath (called by PoseCommandOk) left the biggest cable step
-	// between two samples. Divide by the time one sample interval takes
-	// and that is the peak speed the stage is being asked for.
+	// >>> THE CABLE-DEMAND SCAN AND THE SPEED SCALING ARE GONE. <<<
 	//
-	// This matters because the pose speed, not the tool speed, is usually
-	// what drives the stage: the cable inlet is 218 mm off the centre of
-	// rotation, so ten degrees a second of tilt is tens of millimetres a
-	// second of cable. A pose move that looks gentle can trip the stage.
-	rate    = g_path_seg_max * (double)MOVE_PATH_SAMPLES / tmove;
-	allowed = (double)((C_TOOL_MAX_UU_S * 3) / 4) / 100.0;
-	scale   = 1.0;
-	if (rate > allowed && rate > 0.0) { scale = allowed / rate; }
-
-	// A very slow move beats a refused one, but there has to be a floor or
-	// a pathological request could take all afternoon.
-	if (scale < 0.05) { scale = 0.05; }
-
-	if (scale < 1.0) {
-		print("MOVE: cable would need ",rate," mm/s, stage allows ",allowed," - slowing the whole move to ",scale," of the asked speed");
-		Say(MSG_MOVE_SLOWED);
-	}
-
-	// Scaling ALL FOUR axes by the same factor is the point: the pose path
-	// is unchanged and they still arrive together, the move simply takes
-	// longer. Rate-limiting the stage on its own would let the tool lag
-	// the platform, which is worse than being slow.
+	// 2026-09-30, by request: no path scan, no 75 % stage cap, no scaling.
+	// A move now runs at exactly the speeds in the slots and nothing
+	// works anything out.
+	//
+	// What that removed, so nobody has to reconstruct it from the git log:
+	// ScanPosePath sampled the planned path, found the largest cable step
+	// between consecutive samples, and slowed ALL FOUR axes by a common
+	// factor if the stage could not pay cable out that fast. The cable
+	// inlet sits 218 mm from the centre of rotation, so a degree of tilt
+	// is about 3.8 mm of cable - a pose move that looks gentle can ask the
+	// carriage for tens of mm/s. The table in 3R1T_Kin_1T.mh has the
+	// measured figures.
+	//
+	// So the protection that remains is the drive's own following-error
+	// trip, and there are no limit switches on the stage. Keep the pose
+	// speeds modest until somebody has watched a fast tilt at full travel.
+	vAng  = USER_PARAM(USR_MOVE_VEL);
 	aAng  = USER_PARAM(USR_MOVE_ACC);
+	vTool = USER_PARAM(USR_TOOL_VEL);
 	aTool = USER_PARAM(USR_TOOL_ACC);
-	vAng  = (long)((double)vAng  * scale);
-	aAng  = (long)((double)aAng  * scale);
-	vTool = (long)((double)vTool * scale);
-	aTool = (long)((double)aTool * scale);
 	if (vAng  < 1) { vAng  = 1; }
 	if (aAng  < 1) { aAng  = 1; }
 	if (vTool < 1) { vTool = 1; }
 	if (aTool < 1) { aTool = 1; }
-
-	// The stage still gets its own hard ceiling, in case the scan under-
-	// estimated - a straight tool move has no cable bulge to find.
-	tvmax = (C_TOOL_MAX_UU_S * 3) / 4;
-	if (tvmax < 1) { tvmax = 1; }
-	if (vTool > tvmax) {
-		print("MOVE: tool speed ",vTool," is faster than the drive can follow - clamped to ",tvmax);
-		vTool = tvmax;
-	}
 
 	SetVelAccDec(EE_PSI,     vAng,  aAng,  aAng);
 	SetVelAccDec(EE_PHI,     vAng,  aAng,  aAng);
@@ -565,7 +486,7 @@ void StartPoseMove(void)
 	SetVelAccDec(EE_TOOL,    vTool, aTool, aTool);
 
 	if (g_verbose) print("MOVE to  psi=",USER_PARAM(USR_TGT_PSI)," phi=",USER_PARAM(USR_TGT_PHI)," theta_n=",USER_PARAM(USR_TGT_THETA_N)," tool=",USER_PARAM(USR_TGT_TOOL));
-	if (g_verbose) print("MOVE cable span ",g_path_cable_min," to ",g_path_cable_max," mm over ",tmove / scale," s");
+	if (g_verbose) print("MOVE at  ",vAng," cdeg/s / ",vTool," UU/s - no scaling applied");
 	AxisLinAbsStart(EE_PSI, USER_PARAM(USR_TGT_PSI), EE_PHI, USER_PARAM(USR_TGT_PHI), EE_THETA_N, USER_PARAM(USR_TGT_THETA_N), EE_TOOL, USER_PARAM(USR_TGT_TOOL));
 }
 
@@ -633,7 +554,7 @@ void TeleopCapture(void)
 // One retarget of the simulated axes towards where the operator's hand is.
 void TeleopRetarget(void)
 {
-	long p, h, n, t, mask, moved, vRot, vTool, aRot, aTool, tvmax;
+	long p, h, n, t, mask, moved, vRot, vTool, aRot, aTool;
 
 	// The PC's demand, as a delta from what it was demanding when control
 	// was taken, applied to where the pose was at that moment.
@@ -692,13 +613,10 @@ void TeleopRetarget(void)
 	if (aRot  < 1) { aRot  = 1; }
 	if (aTool < 1) { aTool = 1; }
 
-	// The stage's own ceiling, as StartPoseMove applies it. There is no
-	// path to scan here, so this is the only thing standing between a fast
-	// tilt and asking the carriage for more cable than it can pay out.
-	tvmax = (C_TOOL_MAX_UU_S * 3) / 4;
-	if (tvmax < 1)     { tvmax = 1; }
-	if (vTool > tvmax) { vTool = tvmax; }
-
+	// >>> NO STAGE CEILING HERE EITHER. <<<
+	// The 75 % cap went with the path scan on 2026-09-30. Teleop runs the
+	// tool at exactly USR_TELE_VEL_TOOL, so that slot is now the only thing
+	// bounding how fast a tilt can ask the carriage to pay cable out.
 	SetVelAccDec(EE_PSI,     vRot,  aRot,  aRot);
 	SetVelAccDec(EE_PHI,     vRot,  aRot,  aRot);
 	SetVelAccDec(EE_THETA_N, vRot,  aRot,  aRot);
@@ -746,24 +664,11 @@ void PrintToolDebug(void)
 ///////////////////////////////////////////////////////////////////////////
 // There are no limit switches, so a STALL is the end stop: motor
 // commanded to move, encoder not following.
-long Stalled(void)
-{
-	long v;
-
-	// Held off just after a move starts, while the drive is still taking
-	// up the load.
-	if ((Time() - g_h_moveT0) < H_STALL_ARM_MS) {
-		g_h_stallT0 = Time();
-		return(FALSE);
-	}
-	v = AbsL(USER_PARAM(USR_ENC_VEL));
-	if (v > H_STALL_VEL_MMS) {
-		g_h_stallT0 = Time();
-		return(FALSE);
-	}
-	if ((Time() - g_h_stallT0) > H_STALL_TIME_MS) { return(TRUE); }
-	return(FALSE);
-}
+// Stalled() lived here: the old end-stop detector, which judged a stop
+// from the LINEAR ENCODER VELOCITY alone and so could not tell the
+// carriage wound up against the end of travel from the drive not running
+// at all. Phase A of stage homing now requires the motor to be turning
+// as well - see Home1TSlack.
 
 void StartSearch(long dir)
 {
@@ -1127,8 +1032,8 @@ SmState MainMachine {
 		// At the drum that works out at 8.7 mm/s. Lower it if the tool
 		// wants to go in more gently; the motor has plenty in hand either
 		// way, since 530 rpm is well under the 7000 it can do.
-		USER_PARAM(USR_TOOL_VEL)         = 870;		// [0.01 mm/s]  8.7 mm/s
-		USER_PARAM(USR_TOOL_ACC)         = 7000;	// [0.01 mm/s^2]
+		USER_PARAM(USR_TOOL_VEL)         = 1000;	// [0.01 mm/s]    10 mm/s
+		USER_PARAM(USR_TOOL_ACC)         = 8000;	// [0.01 mm/s^2]  80 mm/s^2
 		USER_PARAM(USR_HOME_VEL)         = 1000;	// [cdeg/s]  10 deg/s
 		// >>> ONE FIGURE FOR ALL FOUR DRIVES, AND IT IS 68% OF NOMINAL. <<<
 		//
@@ -1512,6 +1417,17 @@ SmState MainMachine {
 					Say(MSG_HOME_NO_IMU);
 					return(SmNotHandled);
 				}
+				// >>> AND THE FILTERS MUST HAVE SETTLED. <<<
+				// Before they do, the sensor node has not seeded its
+				// continuity trackers and every theta reads 0 - which is
+				// indistinguishable from three limbs genuinely at zero,
+				// so homing would measure no error and declare success
+				// without having moved anything.
+				if ((USER_PARAM(USR_IMU_STATUS) & IMU_ST_CONVERGED) == 0) {
+					print("HOME refused: limb IMUs still settling - wait a second and press again");
+					Say(MSG_HOME_IMU_SETTLE);
+					return(SmNotHandled);
+				}
 #if (HOME_1T_ENABLE == 1)
 				if (USER_PARAM(USR_ENC_STALE) == TRUE) {
 					print("HOME refused: no stage encoder data on CAN");
@@ -1649,6 +1565,7 @@ SmState MainMachine {
 				USER_PARAM(USR_HOME_STATE) = H_3R_MEASURE;
 				Say(MSG_HOME_MEAS);
 				g_sum1 = 0; g_sum2 = 0; g_sum3 = 0; g_count = 0;
+				g_ref1 = 0; g_ref2 = 0; g_ref3 = 0;
 				g_lastFrame = g_frames;
 				if (g_verbose) print("Homing: measuring (",HOME_AVG_SAMPLES," frames, about 0.3 s)  pass ",g_pass);
 			}
@@ -1670,15 +1587,33 @@ SmState MainMachine {
 				if (g_frames == g_lastFrame) { return(SmNotHandled); }
 				g_lastFrame = g_frames;
 
-				g_sum1 = g_sum1 + USER_PARAM(USR_THETA1);
-				g_sum2 = g_sum2 + USER_PARAM(USR_THETA2);
-				g_sum3 = g_sum3 + USER_PARAM(USR_THETA3);
+				// >>> AVERAGED RELATIVE TO THE FIRST SAMPLE. <<<
+				//
+				// A plain mean of angles is wrong across a seam: 359 and 1
+				// average to 180, which is the opposite side of the limb.
+				// The sensor node now sends a CONTINUOUS angle so there is
+				// no seam in normal running - but a node restart, a garbled
+				// frame or a future change to that packing would put one
+				// back, and a mean that is only correct while nothing goes
+				// wrong is not worth having in a homing routine.
+				//
+				// So the first sample is the reference and only WRAPPED
+				// differences from it are accumulated. Correct either way,
+				// and the same cost.
+				if (g_count == 0) {
+					g_ref1 = USER_PARAM(USR_THETA1);
+					g_ref2 = USER_PARAM(USR_THETA2);
+					g_ref3 = USER_PARAM(USR_THETA3);
+				}
+				g_sum1 = g_sum1 + WrapCDeg(USER_PARAM(USR_THETA1) - g_ref1);
+				g_sum2 = g_sum2 + WrapCDeg(USER_PARAM(USR_THETA2) - g_ref2);
+				g_sum3 = g_sum3 + WrapCDeg(USER_PARAM(USR_THETA3) - g_ref3);
 				g_count = g_count + 1;
 				if (g_count < HOME_AVG_SAMPLES) { return(SmNotHandled); }
 
-				m1 = g_sum1 / g_count;
-				m2 = g_sum2 / g_count;
-				m3 = g_sum3 / g_count;
+				m1 = g_ref1 + g_sum1 / g_count;
+				m2 = g_ref2 + g_sum2 / g_count;
+				m3 = g_ref3 + g_sum3 / g_count;
 				USER_PARAM(USR_MEAS1) = m1;
 				USER_PARAM(USR_MEAS2) = m2;
 				USER_PARAM(USR_MEAS3) = m3;
@@ -1696,7 +1631,7 @@ SmState MainMachine {
 				if (AbsL(d1) <= HOME_TOL_CDEG && AbsL(d2) <= HOME_TOL_CDEG && AbsL(d3) <= HOME_TOL_CDEG) {
 					print("Homing: all limbs within tolerance after ",g_pass," pass(es)");
 					Say(MSG_HOME_LIMBS_OK);
-					return(SmTrans(Home1TSearch));
+					return(SmTrans(Home1TSlack));
 				}
 
 				// ---- RUNAWAY GUARD 1: the error must be shrinking ----
@@ -1781,7 +1716,7 @@ SmState MainMachine {
 					return(SmNotHandled);
 				}
 
-				if (moved == FALSE) { return(SmTrans(Home1TSearch)); }
+				if (moved == FALSE) { return(SmTrans(Home1TSlack)); }
 
 				if (g_verbose) print("Homing: moving to [cdeg] ax1=",g_tgt1," ax2=",g_tgt2," ax3=",g_tgt3);
 				Say(MSG_HOME_MOVE);
@@ -1843,17 +1778,32 @@ SmState MainMachine {
 		// If the end stop comes first, reverse and keep looking. Two end
 		// stops with no REF change means the mark is not on the rail.
 		///////////////////////////////////////////////////////////////////
-		SmState Home1TSearch {
+		///////////////////////////////////////////////////////////////
+		// Phase A - find the end of travel, by CABLE SLACK.
+		//
+		// The REF mark is ignored entirely here. The stage drives in
+		// C_1T_HOME_DIR until the motor is still turning while the
+		// carriage has stopped - which is what winding up against the end
+		// of travel looks like on a cable drive.
+		//
+		// >>> BOTH CONDITIONS, TOGETHER, OR IT PROVES NOTHING. <<<
+		//
+		// The motor turning on its own is the normal state of affairs. The
+		// carriage being still on its own happens whenever the drive has
+		// faulted, tripped or never started - and calling that an end stop
+		// would set the datum in mid-rail with nothing to say it was
+		// wrong. Only the pair, held for H_SLACK_TIME_MS, means slack.
+		///////////////////////////////////////////////////////////////
+		SmState Home1TSlack {
 			SIG_ENTRY = {
-				USER_PARAM(USR_HOME_STATE) = H_1T_SEARCH;
+				USER_PARAM(USR_HOME_STATE) = H_1T_SLACK;
 #if (HOME_1T_ENABLE == 1)
 				Say(MSG_HOME_1T_START);
-				g_h_dir   = C_1T_HOME_DIR;
-				g_h_stops = 0;
-				g_h_t0    = Time();
-				RebaseRef();
-				if (g_verbose) print("Homing: stage searching ",g_h_dir," first at speed ",H_SEARCH_VEL,". Will reverse at the end stop.");
-				if (g_verbose) print("Homing: baseline rise=",g_h_rise0," fall=",g_h_fall0," passes=",g_h_passes0);
+				g_h_dir     = C_1T_HOME_DIR;
+				g_h_t0      = Time();
+				g_h_slackT0 = Time();
+				g_h_encRef  = USER_PARAM(USR_ENC_RAW_UM);
+				if (g_verbose) print("Homing: stage phase A - driving ",g_h_dir," at ",H_SEARCH_VEL," to find the end of travel. REF ignored.");
 				StartSearch(g_h_dir);
 #else
 				Say(MSG_HOME_1T_SKIP);
@@ -1862,46 +1812,132 @@ SmState MainMachine {
 			}
 
 			SIG_IDLE = {
-				long edgeUm, found, d;
+				long mv, d;
 
 #if (HOME_1T_ENABLE == 0)
 				return(SmTrans(HomeFinish));
 #else
 				if (USER_PARAM(USR_ENC_STALE) == TRUE) {
 					sdkStopContinuousMove(C_AXIS_1T, H_DEC);
-					print("Homing: stage encoder went stale mid-search - stopping");
+					print("Homing: stage encoder went stale in phase A - stopping");
 					Say(MSG_HOME_STALE);
 					g_home_failed = TRUE;
 					return(SmNotHandled);
 				}
 
-				if ((Time() - g_h_t0) > H_TIMEOUT_MS) {
+				if ((Time() - g_h_t0) > H_SLACK_TIMEOUT_MS) {
 					sdkStopContinuousMove(C_AXIS_1T, H_DEC);
-					print("Homing: stage TIMEOUT - REF never changed.");
-					print("Homing: rise=",USER_PARAM(USR_REF_RISE_UM)," fall=",USER_PARAM(USR_REF_FALL_UM)," status=",USER_PARAM(USR_ENC_STATUS));
-					print("Homing: baseline was rise=",g_h_rise0," fall=",g_h_fall0," passes=",g_h_passes0);
-					print("Homing: if none of those moved while the stage crossed the mark, REF is");
-					print("Homing: not reaching the ESP32 on GPIO25 while the motor is running.");
-					Say(MSG_HOME_1T_TMO);
+					print("Homing: FAILED - no cable slack in ",H_SLACK_TIMEOUT_MS," ms.");
+					print("Homing: the carriage never stopped moving, so the end of travel");
+					print("Homing: was never reached. Check C_1T_HOME_DIR is driving towards");
+					print("Homing: an end, and that H_SLACK_ENC_UM is not larger than the");
+					print("Homing: movement per ",H_SLACK_TIME_MS," ms at this search speed.");
+					Say(MSG_HOME_1T_NOSLK);
 					g_home_failed = TRUE;
 					return(SmNotHandled);
 				}
 
-				// ---- any change on REF counts ----
+				// Held off while the drive takes up the load, exactly as
+				// the old stall detector was: straight after starting, the
+				// carriage genuinely has not moved yet.
+				if ((Time() - g_h_moveT0) < H_SLACK_ARM_MS) {
+					g_h_slackT0 = Time();
+					g_h_encRef  = USER_PARAM(USR_ENC_RAW_UM);
+					return(SmNotHandled);
+				}
+
+				mv = AbsL(AXE_PROCESS(C_AXIS_1T, REG_AVEL));
+				d  = AbsL(USER_PARAM(USR_ENC_RAW_UM) - g_h_encRef);
+
+				// Either condition failing reopens the window. The encoder
+				// reference moves with it, so the test is always "how far
+				// in the last H_SLACK_TIME_MS", never "since we started".
+				if (mv < H_SLACK_MOTOR_UU_S || d > H_SLACK_ENC_UM) {
+					g_h_slackT0 = Time();
+					g_h_encRef  = USER_PARAM(USR_ENC_RAW_UM);
+					return(SmNotHandled);
+				}
+
+				if ((Time() - g_h_slackT0) > H_SLACK_TIME_MS) {
+					sdkStopContinuousMove(C_AXIS_1T, H_DEC);
+					print("Homing: end of travel - motor at ",mv," UU/s, carriage moved ",d," um in ",H_SLACK_TIME_MS," ms");
+					Say(MSG_HOME_1T_SLACK);
+					return(SmTrans(Home1TRef));
+				}
+				return(SmNotHandled);
+#endif
+			}
+		}
+
+
+		///////////////////////////////////////////////////////////////
+		// Phase B - reverse and take the datum from the REF edge.
+		//
+		// The baseline is taken AFTER the stage has stopped, so an edge
+		// latched during phase A's deceleration is counted as old and
+		// cannot be mistaken for the one we are looking for.
+		//
+		// The datum is the LATCHED edge position. The sensor node now
+		// records the encoder count inside the REF interrupt, so that
+		// figure no longer depends on a speed estimate and is good
+		// whatever the stage was doing when it crossed.
+		//
+		// Note there is no "already on the mark" shortcut here, unlike
+		// the old single-phase search: phase A has just driven to the end
+		// of travel, so the mark is behind us and a genuine new edge will
+		// arrive on the way back.
+		///////////////////////////////////////////////////////////////
+		SmState Home1TRef {
+			SIG_ENTRY = {
+				USER_PARAM(USR_HOME_STATE) = H_1T_REF;
+				WaitStageStopped(3000);
+				RebaseRef();
+				g_h_t0     = Time();
+				g_h_encRef = USER_PARAM(USR_ENC_RAW_UM);
+				if (g_verbose) print("Homing: stage phase B - reversing to ",(0 - C_1T_HOME_DIR)," to find REF");
+				if (g_verbose) print("Homing: baseline rise=",g_h_rise0," fall=",g_h_fall0," passes=",g_h_passes0);
+				StartSearch(0 - C_1T_HOME_DIR);
+			}
+
+			SIG_IDLE = {
+				long edgeUm, found, travelled;
+
+				if (USER_PARAM(USR_ENC_STALE) == TRUE) {
+					sdkStopContinuousMove(C_AXIS_1T, H_DEC);
+					print("Homing: stage encoder went stale in phase B - stopping");
+					Say(MSG_HOME_STALE);
+					g_home_failed = TRUE;
+					return(SmNotHandled);
+				}
+
+				travelled = AbsL(USER_PARAM(USR_ENC_RAW_UM) - g_h_encRef);
+
+				if (travelled > H_REF_MAX_TRAVEL_UM || (Time() - g_h_t0) > H_REF_TIMEOUT_MS) {
+					sdkStopContinuousMove(C_AXIS_1T, H_DEC);
+					print("Homing: FAILED - no new REF edge in ",travelled," um / ",(Time() - g_h_t0)," ms");
+					print("Homing: rise=",USER_PARAM(USR_REF_RISE_UM)," fall=",USER_PARAM(USR_REF_FALL_UM)," passes=",RefPasses());
+					print("Homing: baseline was rise=",g_h_rise0," fall=",g_h_fall0," passes=",g_h_passes0);
+					print("Homing: if none of those moved while the stage crossed the mark, REF");
+					print("Homing: is not reaching the ESP32 while the motor is running.");
+					Say(MSG_HOME_1T_NOREF);
+					g_home_failed = TRUE;
+					return(SmNotHandled);
+				}
+
+				// A NEW latched edge, of either polarity. The pass counter
+				// is the backstop: a crossing fast enough to latch both
+				// edges between two CAN frames still bumps it.
 				found  = FALSE;
-				edgeUm = USER_PARAM(USR_ENC_RAW_UM);
+				edgeUm = 0;
 
 				if (USER_PARAM(USR_REF_RISE_UM) != g_h_rise0) {
 					edgeUm = USER_PARAM(USR_REF_RISE_UM);
 					found  = TRUE;
-					if (g_verbose) print("Homing: RISING edge at ",edgeUm," um");
+					if (g_verbose) print("Homing: RISING edge latched at ",edgeUm," um");
 				} else if (USER_PARAM(USR_REF_FALL_UM) != g_h_fall0) {
 					edgeUm = USER_PARAM(USR_REF_FALL_UM);
 					found  = TRUE;
-					if (g_verbose) print("Homing: FALLING edge at ",edgeUm," um");
-				} else if ((USER_PARAM(USR_ENC_STATUS) & 0x01) == 1) {
-					found = TRUE;
-					if (g_verbose) print("Homing: ON the mark at ",edgeUm," um (level high)");
+					if (g_verbose) print("Homing: FALLING edge latched at ",edgeUm," um");
 				} else if (RefPasses() != g_h_passes0) {
 					edgeUm = USER_PARAM(USR_REF_FALL_UM);
 					found  = TRUE;
@@ -1921,93 +1957,11 @@ SmState MainMachine {
 					Say(MSG_HOME_1T_FOUND);
 					return(SmTrans(HomeFinish));
 				}
-
-				// ---- backing off an end stop ----
-				// Keep driving the other way and do NOT judge stalls until
-				// the encoder has actually moved. Straight after reversing
-				// the stage is still loaded against the stop, so the stall
-				// detector would call a second end stop immediately without
-				// the stage having gone anywhere.
-				if (USER_PARAM(USR_HOME_STATE) == H_1T_BACKOFF) {
-					d = AbsL(USER_PARAM(USR_ENC_RAW_UM) - g_h_backPos);
-
-					if (d > H_BACKOFF_UM) {
-						if (g_verbose) print("Homing: clear of the end stop (moved ",d," um) - searching for REF again");
-						USER_PARAM(USR_HOME_STATE) = H_1T_SEARCH;
-						Say(MSG_HOME_1T_CLEAR);
-						g_h_moveT0  = Time();
-						g_h_stallT0 = Time();
-						return(SmNotHandled);
-					}
-
-					if ((Time() - g_h_backT0) > H_BACKOFF_MAX_MS) {
-						sdkStopContinuousMove(C_AXIS_1T, H_DEC);
-						print("Homing: FAILED - reversed off the end stop but the encoder never moved");
-						print("Homing: (only ",d," um in ",H_BACKOFF_MAX_MS," ms). The drive is not turning,");
-						print("Homing: or the stage is jammed against the stop.");
-						Say(MSG_HOME_1T_JAM);
-						g_home_failed = TRUE;
-						return(SmNotHandled);
-					}
-					return(SmNotHandled);
-				}
-
-				// No limit switches, so a stall IS the end stop. Only
-				// judged while genuinely searching - see above.
-				if (Stalled() == TRUE) {
-					// One reversal is all that can help: if the mark was
-					// not between this end stop and the other one, it is
-					// not on the rail.
-					g_h_stops = g_h_stops + 1;
-					if (g_h_stops > 1) {
-						sdkStopContinuousMove(C_AXIS_1T, H_DEC);
-						print("Homing: FAILED - end stop at BOTH ends without REF ever changing.");
-						print("Homing: check the REF wiring on GPIO25, and whether the pass count moves");
-						print("Homing: while the motor is RUNNING, not just when pushed by hand.");
-						Say(MSG_HOME_1T_FAIL);
-						g_home_failed = TRUE;
-						return(SmNotHandled);
-					}
-					print("Homing: end stop reached (motor driving, encoder still) - reversing");
-					Say(MSG_HOME_1T_STOP);
-					sdkStopContinuousMove(C_AXIS_1T, H_DEC);
-					g_h_dir     = -g_h_dir;
-					g_h_backT0  = Time();
-					g_h_backPos = USER_PARAM(USR_ENC_RAW_UM);
-					RebaseRef();
-					USER_PARAM(USR_HOME_STATE) = H_1T_BACKOFF;
-					StartSearch(g_h_dir);
-				}
 				return(SmNotHandled);
-#endif
-			}
-
-			SIG_EXIT = {
-				sdkStopContinuousMove(C_AXIS_1T, H_DEC);
 			}
 		}
 
 
-		///////////////////////////////////////////////////////////////////
-		// Capture the datum and hand the drives to the kinematics.
-		//
-		// This is the join between homing and motion, and it is the one
-		// place where a mistake steps the motors instead of ramping them.
-		//
-		// AxisControl(USERREFPOS) makes the drive jump to whatever
-		// REG_USERREFPOS holds, immediately, with no ramp. The way that is
-		// made safe here is that the ISR has been pinning the offsets to
-		// the axes' actual positions all along (g_ik_armed == 0), so the
-		// register already reads "stay exactly where you are". There is
-		// nothing to jump to.
-		//
-		// Order matters, and each step is here for a reason:
-		//   1. re-seed the IK continuity tracker at zero - this pose IS
-		//      its zero;
-		//   2. zero the commanded-pose axes, so "0,0,0,0" means here;
-		//   3. wait for the ISR to run with the new zero;
-		//   4. only then arm and switch.
-		///////////////////////////////////////////////////////////////////
 		SmState HomeFinish {
 			SIG_ENTRY = {
 				USER_PARAM(USR_HOME_STATE) = H_FINISH;
@@ -2099,6 +2053,12 @@ SmState MainMachine {
 				if (USER_PARAM(USR_THETA_STALE) == TRUE) {
 					print("HOME refused: no limb angles on CAN");
 					Say(MSG_HOME_NO_IMU);
+					return(SmNotHandled);
+				}
+				// See the note at the other HOME entry point.
+				if ((USER_PARAM(USR_IMU_STATUS) & IMU_ST_CONVERGED) == 0) {
+					print("HOME refused: limb IMUs still settling - wait a second and press again");
+					Say(MSG_HOME_IMU_SETTLE);
 					return(SmNotHandled);
 				}
 #if (HOME_1T_ENABLE == 1)

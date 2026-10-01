@@ -90,8 +90,12 @@ long g_isr_t0 = 0;
 ///////////////////////////////////////////////////////////////////////////
 // CAN receivers
 ///////////////////////////////////////////////////////////////////////////
-long canObjTheta = -1, canObjPlat = -1, canObjTrans = -1, canObjRef = -1;
-long canLastRxTheta = 0, canLastRxPlat = 0, canLastRxEnc = 0;
+long canObjTheta = -1, canObjTheta2 = -1, canObjPlat = -1;
+long canObjTrans = -1, canObjRef = -1;
+// The limb angles arrive as TWO frames now, so both are timed. A node
+// sending 0x6E4 but not 0x6E5 would otherwise leave theta3 quietly stale
+// while the staleness flag stayed clear.
+long canLastRxTheta = 0, canLastRxTheta2 = 0, canLastRxPlat = 0, canLastRxEnc = 0;
 long g_frames = 0;				// theta frames received, for the averager
 
 
@@ -99,6 +103,14 @@ long g_frames = 0;				// theta frames received, for the averager
 // Homing
 ///////////////////////////////////////////////////////////////////////////
 long g_sum1 = 0, g_sum2 = 0, g_sum3 = 0, g_count = 0;
+// The first sample of a measurement run. Everything after it is summed as a
+// WRAPPED difference from it, so the mean is right even across a 360/0
+// seam - see Home3RMeasure.
+long g_ref1 = 0, g_ref2 = 0, g_ref3 = 0;
+
+// Stage homing, phase A. g_h_encRef is the carriage position when the
+// current slack window opened; either condition failing reopens it.
+long g_h_slackT0 = 0, g_h_encRef = 0;
 long g_lastFrame = 0;
 long g_tgt1 = 0, g_tgt2 = 0, g_tgt3 = 0;
 long g_move_t0 = 0;
@@ -124,9 +136,9 @@ long g_h_stallT0 = 0;
 long g_h_rise0   = 0;			// REF edge values latched when this leg began
 long g_h_fall0   = 0;
 long g_h_passes0 = 0;
-long g_h_stops   = 0;			// end stops hit so far
-long g_h_backT0  = 0;
-long g_h_backPos = 0;
+// g_h_stops / g_h_backT0 / g_h_backPos belonged to the old single-phase
+// stage search and its end-stop back-off. Removed 2026-09-30 with the
+// move to the two-phase sequence.
 
 // How a homing child tells its parent it is finished.
 //
@@ -246,15 +258,12 @@ long g_boot_err4 = 0;
 ///////////////////////////////////////////////////////////////////////////
 // Move planning
 //
-// The stage does not just track the tool box: it also pays out whatever
-// the platform tilt swallows, and that term is the larger of the two - so
-// a move is looked at along its whole path before it starts.
-//
-// ScanPosePath fills these in; PoseCommandOk and StartPoseMove read them.
+// The g_path_* cable-scan results lived here: the least and most cable a
+// planned move would need, and the biggest step between two samples of
+// it. ScanPosePath filled them and StartPoseMove scaled every axis to
+// suit. All of it was removed 2026-09-30 by request - a move now runs at
+// the speeds in the slots and nothing is worked out.
 ///////////////////////////////////////////////////////////////////////////
-double g_path_cable_min = 0;	// least cable the path ever needs   [mm]
-double g_path_cable_max = 0;	// most it ever needs                [mm]
-double g_path_seg_max   = 0;	// biggest step between two samples  [mm]
 
 
 ///////////////////////////////////////////////////////////////////////////
@@ -520,6 +529,20 @@ void Say(long msg)
 		case MSG_HOME_1T_JAM:   print(">> HOMING failed: stage jammed on the end stop"); break;
 		case MSG_HOME_1T_TMO:   print(">> HOMING failed: stage timed out"); break;
 		case MSG_HOME_1T_SKIP:  print(">> HOMING: stage homing disabled, skipped"); break;
+		case MSG_HOME_1T_SLACK: print(">> HOMING: end of travel found, reversing for REF"); break;
+		case MSG_HOME_1T_NOSLK: print(">> HOMING failed: never reached the end of travel"); break;
+		case MSG_HOME_1T_NOREF: print(">> HOMING failed: no REF edge on the way back"); break;
+		case MSG_HOME_IMU_SETTLE: print(">> HOME refused: limb IMUs still settling, wait a moment"); break;
+		// >>> THE TELEOP CODES HAD NO TEXT AT ALL UNTIL NOW. <<<
+		// Say() was setting USR_MSG and printing nothing, so every teleop
+		// event was silent in the terminal.
+		case MSG_TELE_ENTER:    print(">> TELEOP: hold the enable to take control"); break;
+		case MSG_TELE_FOLLOW:   print(">> TELEOP: following the haptic device"); break;
+		case MSG_TELE_RELEASE:  print(">> TELEOP: enable released - pose held"); break;
+		case MSG_TELE_LOST:     print(">> TELEOP: link lost - pose held"); break;
+		case MSG_TELE_EXIT:     print(">> TELEOP: finished"); break;
+		case MSG_TELE_NO_LINK:  print(">> TELEOP refused: no heartbeat from the PC"); break;
+		case MSG_TELE_NOT_HOMED:print(">> TELEOP refused: home the rig first"); break;
 		case MSG_HOME_ALIGN:    print(">> HOMING: capturing datum, aligning kinematics"); break;
 		case MSG_HOME_DONE:     print(">> HOMED - ready to move"); break;
 		case MSG_HOME_ABORT:    print(">> HOMING: aborted"); break;
