@@ -42,7 +42,7 @@ from tkinter import ttk
 
 import wall as wallmod
 from macs_tcp import MacsTcp, MacsTcpError, discover_ip
-from mapping import MapConfig, PoseMap
+from mapping import MapConfig, PoseMap, euler_xyz_deg
 from touch import BUTTON_1, BUTTON_2, HDError, Touch
 
 CONFIG_MH = Path(__file__).resolve().parent.parent / "main" / "3R1T_Config.mh"
@@ -109,6 +109,11 @@ class Shared:
     trips: int = 0
     clamped_rig: int = 0
     tremor: int = 0
+    # The RAW stylus, independent of any clutch. See the note where it
+    # is displayed.
+    stylus_pos: tuple = (0.0, 0.0, 0.0)
+    stylus_rpy: tuple = (0.0, 0.0, 0.0)
+    touch_id: str = ""
     ik: tuple = (0, 0, 0, 0)
     led: int = 0
 
@@ -130,6 +135,12 @@ class Worker(threading.Thread):
         self.wall_on = False
         self._dev: Touch | None = None
         self._macs: MacsTcp | None = None
+        # Neither device is addressed by a COM port. The Touch is found by
+        # OpenHaptics from its own driver configuration - a NAME, not a
+        # port - and the controller is an IP found by broadcast. Both are
+        # settable from the window so neither is baked in.
+        self.touch_name = ""          # "" = the OpenHaptics default device
+        self.macs_addr  = ""          # "" = discover by broadcast
 
     # ---- called from the GUI thread; only ever enqueues -----------------
     def send_command(self, name: str, value: int | None = None):
@@ -141,11 +152,21 @@ class Worker(threading.Thread):
                 setattr(self.shared, k, v)
 
     def run(self):
-        try:
-            self._connect()
-        except Exception as e:                      # noqa: BLE001 - report, not crash
-            self._set(note=f"startup failed: {e}")
-            return
+        # >>> THE TOUCH GOES FIRST, AND ON PURPOSE. <<<
+        # Finding the controller means a broadcast that takes about five
+        # seconds when nothing answers. Doing that first left the window
+        # saying "Touch: not open" for five seconds at every start-up,
+        # which reads as the haptic device not being detected. It opens in
+        # well under a second, so it opens first.
+        self._connect_touch()
+        # >>> AND THE CONTROLLER SEARCH DOES NOT BLOCK THE POSE LOOP. <<<
+        # The broadcast takes about five seconds when nothing answers.
+        # Done on this thread it froze the whole window for that long -
+        # including the raw stylus row, which is the one thing that proves
+        # the haptic device is alive. discover_ip() touches no socket of
+        # ours, so it is safe on a thread of its own; only the open() has
+        # to come back here, which it does through the command queue.
+        self._start_macs_search()
         try:
             self._loop()
         except Exception as e:                      # noqa: BLE001
@@ -153,38 +174,96 @@ class Worker(threading.Thread):
         finally:
             self._shutdown()
 
-    def _connect(self):
-        self._set(note="looking for the controller on Ethernet")
-        ip = discover_ip()
-        if ip:
-            try:
-                self._macs = MacsTcp(ip).open()
-                self._set(macs_ok=True, note=f"controller at {ip}")
-                # A controller still running a pre-tremor build leaves slot
-                # 19 at zero, which this code is entitled to read as "band
-                # off". Say so rather than quietly not filtering.
-                band = self._macs.read_param(slot("USR_TELE_TREMOR"))
-                self.cfg.tremor_deg = max(0.0, band / 100.0)
-                self._set(tremor=band)
-                if band == 0:
-                    self._set(note=f"controller at {ip} - TREMOR BAND IS 0, "
-                                   f"no filtering. Download the current .mc, "
-                                   f"or set it here and Apply.")
-            except MacsTcpError as e:
-                self._set(note=f"controller found but not open: {e}")
-        else:
-            self._set(note="no controller answered - is X4 cabled?")
-
-        self._set(note=(self.shared.note + "; opening the Touch"))
-        self._dev = Touch().open()
-        if not self._dev.is_live():
-            raise RuntimeError("Touch returns no valid orientation - check its power")
-
+    def _connect_touch(self):
+        """Open the haptic device. A failure here is reportable, not fatal:
+        the Reconnect button exists so a flat power supply or a device
+        plugged in late does not mean restarting the program."""
+        if self._dev is not None:
+            return
+        name = self.touch_name.strip()
+        self._set(note=f"opening the Touch{f' as {name!r}' if name else ''} ...")
+        try:
+            dev = Touch(name or None).open()
+        except Exception as e:                      # noqa: BLE001
+            self._set(touch_ok=False, note=f"Touch will not open: {e}")
+            return
+        if not dev.is_live():
+            dev.close()
+            self._set(touch_ok=False,
+                      note="Touch opened but returns no valid orientation - "
+                           "check its power supply, it is separate from USB")
+            return
+        self._dev = dev
+        info = dev.info
+        self._set(touch_id=f"{info['model']} {info['serial']}")
         # The insertion wall is ON from the start. It is the only fence the
-        # operator can actually feel, so leaving it as something to remember
-        # to switch on was the wrong default.
+        # operator can actually feel, so leaving it opt-in was wrong.
         self._set_wall(True)
-        self._set(touch_ok=True, note="ready")
+        self._set(touch_ok=True, note="Touch ready")
+
+    def _start_macs_search(self):
+        """Find the controller off-thread and queue the open."""
+        def search():
+            addr = self.macs_addr.strip()
+            if not addr:
+                self._set(note="looking for the controller on Ethernet ...")
+                addr = discover_ip() or ""
+            if addr:
+                self.commands.put(("connect_macs", addr))
+            else:
+                self._set(macs_ok=False,
+                          note="no controller answered the broadcast - type its "
+                               "address and press Reconnect, or check X4")
+        threading.Thread(target=search, daemon=True).start()
+
+    def _connect_macs(self):
+        """Open the controller. Discovers the address unless one was given."""
+        if self._macs is not None:
+            return
+        addr = self.macs_addr.strip()
+        if not addr:
+            self._set(note="looking for the controller on Ethernet ...")
+            addr = discover_ip() or ""
+            if not addr:
+                self._set(macs_ok=False,
+                          note="no controller answered the broadcast - type its "
+                               "address and press Reconnect, or check X4")
+                return
+            self.macs_addr = addr
+        try:
+            self._macs = MacsTcp(addr).open()
+        except MacsTcpError as e:
+            self._set(macs_ok=False, note=f"controller {addr}: {e}")
+            return
+        self._set(macs_ok=True, note=f"controller at {addr}")
+        # A controller still running a pre-tremor build leaves slot 19 at
+        # zero, which this code is entitled to read as "band off". Say so
+        # rather than quietly not filtering.
+        try:
+            band = self._macs.read_param(slot("USR_TELE_TREMOR"))
+            self.cfg.tremor_deg = max(0.0, band / 100.0)
+            self._set(tremor=band)
+            if band == 0:
+                self._set(note=f"controller at {addr} - TREMOR BAND IS 0, no "
+                               f"filtering. Download the current .mc, or set "
+                               f"it here and Apply.")
+        except MacsTcpError:
+            pass
+
+    def _disconnect(self):
+        """Drop both so the next connect attempt starts clean."""
+        if self._macs is not None:
+            self._macs.close()
+            self._macs = None
+        if self._dev is not None:
+            try:
+                self._dev.stop_wall_loop()
+            except Exception:                       # noqa: BLE001
+                pass
+            self._dev.close()
+            self._dev = None
+        self.wall_on = False
+        self._set(touch_ok=False, macs_ok=False)
 
     def _shutdown(self):
         if self._macs is not None:
@@ -212,8 +291,18 @@ class Worker(threading.Thread):
             except queue.Empty:
                 return
             try:
-                if name == "cmd" and self._macs:
-                    self._macs.write_param(slot("USR_COMMAND"), value)
+                # >>> A COMMAND WITH NO CONTROLLER MUST NOT VANISH. <<<
+                # This used to be "if name == cmd and self._macs", so with
+                # no connection a button press was silently discarded -
+                # indistinguishable from a broken button.
+                if name == "cmd":
+                    code, label = value
+                    if self._macs is None:
+                        self._set(note=f"{label} NOT SENT - no controller "
+                                       f"connected. Reconnect first.")
+                    else:
+                        self._macs.write_param(slot("USR_COMMAND"), code)
+                        self._set(note=f"{label} sent")
                 elif name == "zero":
                     if not (self.mapper.rot_engaged or self.mapper.trans_engaged):
                         self.mapper.pose_deg[:] = 0.0
@@ -221,7 +310,10 @@ class Worker(threading.Thread):
                         self._set(note="PC pose zeroed")
                     else:
                         self._set(note="release the clutches before zeroing")
-                elif name == "speeds" and self._macs:
+                elif name == "speeds":
+                    if self._macs is None:
+                        self._set(note="speeds NOT SENT - no controller connected")
+                        continue
                     vr, vt, acc, tremor = value
                     self._macs.write_param(slot("USR_TELE_VEL_ROT"), vr)
                     self._macs.write_param(slot("USR_TELE_VEL_TOOL"), vt)
@@ -231,6 +323,14 @@ class Worker(threading.Thread):
                                    f"tremor {tremor/100:.2f} deg")
                 elif name == "wall":
                     self._set_wall(bool(value))
+                elif name == "connect_macs":
+                    self.macs_addr = value
+                    self._connect_macs()
+                elif name == "reconnect":
+                    self.touch_name, self.macs_addr = value
+                    self._disconnect()
+                    self._connect_touch()
+                    self._start_macs_search()
             except MacsTcpError as e:
                 self._set(note=f"command failed: {e}")
 
@@ -259,6 +359,12 @@ class Worker(threading.Thread):
         while not self.stop_flag.is_set():
             loop = time.perf_counter()
             self._drain_commands()
+
+            # No device: idle slowly rather than spinning or dying, so the
+            # window stays live and Reconnect still gets serviced.
+            if self._dev is None:
+                time.sleep(0.1)
+                continue
 
             s = self._dev.snapshot() if self.wall_on else self._dev.read()
 
@@ -327,8 +433,11 @@ class Worker(threading.Thread):
                     except MacsTcpError:
                         pass
 
+            (sr, sp, sy), _ = euler_xyz_deg(s.rotation)
             self._set(rot=rot, tra=tra, enable=enable, send_ms=send_ms,
                       failures=failures,
+                      stylus_pos=(s.position[0], s.position[1], s.position[2]),
+                      stylus_rpy=(sr, sp, sy),
                       pose=(cmd.psi_deg, cmd.phi_deg, cmd.theta_n_deg, cmd.tool_mm),
                       clamped_pc=cmd.clamped,
                       rate=n / max(time.perf_counter() - t0, 1e-6))
@@ -352,11 +461,45 @@ class App:
         self.vars: dict[str, tk.StringVar] = {}
 
         # ---- connection -------------------------------------------------
+        #
+        # >>> NEITHER OF THESE IS A COM PORT. <<<
+        #
+        # The Touch does enumerate as a COM port in Windows, but nothing
+        # here opens it that way - OpenHaptics finds it from its own driver
+        # configuration, which is identified by a NAME. Blank means the
+        # default device, which is the only one configured unless somebody
+        # has run Touch_Setup and defined more.
+        #
+        # The controller is an IP address, not a port either. Blank means
+        # find it by broadcast, which is the normal case - it self-assigns
+        # a link-local 169.254.x that can change between boots, so a fixed
+        # address here would be the thing that went stale.
         box = ttk.LabelFrame(root, text="Connection")
         box.pack(fill="x", **pad)
-        self._row(box, 0, "Touch", "touch")
-        self._row(box, 1, "Controller", "macs")
-        self._row(box, 2, "Loop", "loop")
+
+        ttk.Label(box, text="Touch device", width=22, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=6, pady=2)
+        self.touch_name = tk.StringVar(value="")
+        self.touch_pick = ttk.Combobox(box, textvariable=self.touch_name,
+                                       width=18, values=("",))
+        self.touch_pick.grid(row=0, column=1, sticky="w")
+        ttk.Label(box, text="blank = default", foreground="grey45").grid(
+            row=0, column=2, sticky="w", padx=6)
+
+        ttk.Label(box, text="Controller address", width=22, anchor="e").grid(
+            row=1, column=0, sticky="e", padx=6, pady=2)
+        self.macs_addr = tk.StringVar(value="")
+        ttk.Entry(box, textvariable=self.macs_addr, width=18).grid(
+            row=1, column=1, sticky="w")
+        ttk.Label(box, text="blank = find it", foreground="grey45").grid(
+            row=1, column=2, sticky="w", padx=6)
+
+        ttk.Button(box, text="Reconnect", command=self.reconnect).grid(
+            row=0, column=3, rowspan=2, padx=10)
+
+        self._row(box, 2, "Touch", "touch")
+        self._row(box, 3, "Controller", "macs")
+        self._row(box, 4, "Loop", "loop")
 
         # ---- rig --------------------------------------------------------
         box = ttk.LabelFrame(root, text="Rig")
@@ -368,6 +511,19 @@ class App:
         self._row(box, 0, "State", "rig_state")
         self._row(box, 1, "Message", "rig_msg")
         self._row(box, 2, "Teleop", "tele")
+
+        # ---- raw stylus -------------------------------------------------
+        #
+        # >>> THIS ROW IS WHY A STILL WINDOW DOES NOT MEAN A DEAD DEVICE. <<<
+        #
+        # Everything below is a COMMANDED value, so with no clutch held it
+        # all sits at zero and waving the stylus changes nothing on screen -
+        # which looks exactly like the haptic device not being detected.
+        # This row is the raw device, always live, clutch or no clutch.
+        box = ttk.LabelFrame(root, text="Stylus  (raw - always live)")
+        box.pack(fill="x", **pad)
+        self._row(box, 0, "position  x y z [mm]", "sty_pos")
+        self._row(box, 1, "roll pitch yaw [deg]", "sty_rpy")
 
         # ---- pose -------------------------------------------------------
         box = ttk.LabelFrame(root, text="Commanded pose   (* = clamped)")
@@ -413,16 +569,19 @@ class App:
         # ---- buttons ----------------------------------------------------
         bar = ttk.Frame(root)
         bar.pack(fill="x", **pad)
-        ttk.Button(bar, text="HOME", width=12,
-                   command=lambda: self.cmd("C_CMD_HOME")).pack(side="left", padx=4)
-        ttk.Button(bar, text="TELEOP", width=12,
-                   command=lambda: self.cmd("C_CMD_TELEOP")).pack(side="left", padx=4)
+        self.rig_buttons = []
+        for text, code in (("HOME", "C_CMD_HOME"), ("TELEOP", "C_CMD_TELEOP"),
+                           ("Clear error", "C_CMD_ERROR_CLR")):
+            b = ttk.Button(bar, text=text, width=12,
+                           command=lambda c=code: self.cmd(c))
+            b.pack(side="left", padx=4)
+            self.rig_buttons.append(b)
+        # Zeroing is PC-side and works with no controller at all.
         ttk.Button(bar, text="Zero PC pose", width=14,
                    command=lambda: worker.send_command("zero")).pack(side="left", padx=4)
-        ttk.Button(bar, text="Clear error", width=12,
-                   command=lambda: self.cmd("C_CMD_ERROR_CLR")).pack(side="left", padx=4)
 
-        stop = tk.Button(root, text="S T O P", command=lambda: self.cmd("C_CMD_STOP"),
+        self.stop_btn = stop = tk.Button(
+                         root, text="S T O P", command=lambda: self.cmd("C_CMD_STOP"),
                          bg="#b00020", fg="white", activebackground="#d32f2f",
                          activeforeground="white",
                          font=("Segoe UI", 16, "bold"), height=2)
@@ -448,7 +607,9 @@ class App:
 
     # ---- actions --------------------------------------------------------
     def cmd(self, name: str):
-        self.worker.send_command("cmd", D[name])
+        # The label travels with the code so a refusal can name the button
+        # rather than reporting a bare number.
+        self.worker.send_command("cmd", (D[name], name[6:].replace("_", " ")))
 
     def apply_speeds(self):
         try:
@@ -462,6 +623,14 @@ class App:
     def toggle_wall(self):
         self.worker.send_command("wall", int(self.wall_var.get()))
 
+    def reconnect(self):
+        """Drop both devices and open them again with whatever is typed.
+
+        Does the work on the worker thread like every other command - the
+        socket and the haptic device both belong to it."""
+        self.worker.send_command("reconnect",
+                                 (self.touch_name.get(), self.macs_addr.get()))
+
     def quit(self):
         self.note.config(text="stopping - clearing the enable and sending STOP")
         self.root.update_idletasks()
@@ -474,8 +643,14 @@ class App:
         s = self.worker.shared.snapshot()
         v = self.vars
 
-        v["touch"].set("open" if s["touch_ok"] else "not open")
+        v["touch"].set(f"open   {s['touch_id']}" if s["touch_ok"] else "not open")
+        v["sty_pos"].set("  ".join(f"{c:+8.2f}" for c in s["stylus_pos"]))
+        v["sty_rpy"].set("  ".join(f"{c:+8.2f}" for c in s["stylus_rpy"]))
         v["macs"].set("open" if s["macs_ok"] else "not open")
+        # Blank means "find it", so show what was found rather than leaving
+        # the operator guessing which address is in use.
+        if s["macs_ok"] and not self.macs_addr.get().strip():
+            self.macs_addr.set(self.worker.macs_addr)
         v["loop"].set(f"{s['rate']:5.1f} Hz     send {s['send_ms']:4.1f} ms")
 
         v["rig_state"].set(f"0x{s['rig_state']:03X}  {bits(s['rig_state'], 'C_STA_')}")
@@ -499,6 +674,13 @@ class App:
             f"{'ROT' if s['rot'] else '---'} {'TRA' if s['tra'] else '---'}"
             f"   enable {s['enable']}   tremor {s['tremor']/100:.2f} deg"
             + (f"   rig clamping {' '.join(names)}" if names else ""))
+
+        # Nothing to send to means nothing to press. Clearer than letting a
+        # press look like it worked.
+        state = "normal" if s["macs_ok"] else "disabled"
+        for b in self.rig_buttons:
+            b.config(state=state)
+        self.stop_btn.config(state=state)
 
         colour = {1: "#2e7d32", 2: "#f9a825", 4: "#b00020"}.get(s["led"], "grey30")
         if s["tele_state"] == D.get("TELE_FOLLOW", 2):

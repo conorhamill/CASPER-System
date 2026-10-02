@@ -137,7 +137,16 @@ def discover_ip(timeout_ms: int = 1500) -> str | None:
 class MacsTcp:
     """Same surface as macs.Macs, so callers can swap transport."""
 
-    def __init__(self, address: str = "169.254.231.1", port: int = DEFAULT_PORT,
+    # >>> THE ADDRESS IS REQUIRED. THERE IS NO DEFAULT. <<<
+    #
+    # It used to default to 169.254.231.1, which is what the controller
+    # happened to self-assign one afternoon. That is a LINK-LOCAL address:
+    # it is handed out by the controller to itself when no DHCP server
+    # answers, and it can change between boots. A default like that works
+    # until the day it doesn't, and then it fails as a connection timeout
+    # that looks like a cabling fault. Use discover_ip(), or pass the
+    # address you actually want.
+    def __init__(self, address: str, port: int = DEFAULT_PORT,
                  sdo_number: int = 0, timeout_s: float = 2.0):
         self.address = address
         self.port = port
