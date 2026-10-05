@@ -268,6 +268,21 @@
 #define USR_MSG				4	// last message code, MSG_*. The words go to
 								// the terminal - see Say() in Globals.
 
+// --- where the pose IS, written by the rig every idle pass ---------------
+// Cpos of the four simulated pose axes, i.e. what the kinematics ISR is
+// feeding the drives right now. Not the same as USR_TGT_* below, which is
+// what somebody ASKED for: under teleop the pose lags the target, and a
+// clutch released mid-move leaves it short.
+//
+// The haptic PC reads these when a clutch press starts a new follow and
+// restarts its own idea of the pose from them. Without that, the PC kept
+// the target as if it had been reached, placed its fences and the haptic
+// wall from it, and the operator hit a wall with travel still to spare.
+#define USR_POSE_PSI		5	// [cdeg]
+#define USR_POSE_PHI		6	// [cdeg]
+#define USR_POSE_THETA_N	7	// [cdeg]
+#define USR_POSE_TOOL		8	// [0.01 mm]
+
 // --- the four commanded values ------------------------------------------
 #define USR_TGT_PSI			10	// [cdeg]
 #define USR_TGT_PHI			11	// [cdeg]

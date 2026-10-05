@@ -349,6 +349,26 @@ class Worker(threading.Thread):
             self._set(note="force wound down")
         self.wall_on = want
 
+    def _sync_from_rig(self):
+        """Take the rig's actual pose as the PC's, if the rig is about to
+        re-base from it. Any failure leaves the PC's own pose in place,
+        which is how it behaved before this existed."""
+        if self._macs is None:
+            return
+        try:
+            state = self._macs.read_param(slot("USR_TELE_STATE"))
+            if state not in (D["TELE_WAIT_ENABLE"], D["TELE_DROPPED"]):
+                return
+            psi, phi, thn, tool = self._macs.read_params(slot("USR_POSE_PSI"),
+                                                         slot("USR_POSE_TOOL"))
+        except MacsTcpError as e:
+            self._set(note=f"pose sync failed, using PC pose: {e}")
+            return
+        if self.mapper.sync_from_rig((psi / 100.0, phi / 100.0, thn / 100.0),
+                                     tool / 100.0):
+            self._set(note=f"synced to rig: {psi/100:+.2f} {phi/100:+.2f} "
+                           f"{thn/100:+.2f} deg, tool {tool/100:+.2f} mm")
+
     def _loop(self):
         period = 1.0 / RATE_HZ
         t0 = time.perf_counter()
@@ -372,6 +392,17 @@ class Worker(threading.Thread):
             rot_was = bool(prev_buttons & BUTTON_1)
             tra_was = bool(prev_buttons & BUTTON_2)
             prev_buttons = s.buttons
+
+            # >>> A PRESS FROM NOTHING HELD STARTS FROM THE RIG, NOT FROM US.
+            # Letting go stops the rig wherever it has got to, which after a
+            # fast move is well short of what this side commanded. The rig
+            # re-bases from its real pose on this press; without matching it
+            # here the PC's fences and the haptic wall stayed where the
+            # target had been, and the operator hit a wall with travel left.
+            # Only from nothing held: with the other clutch still down the
+            # rig is still following and a change here would be a step.
+            if (rot or tra) and not (rot_was or tra_was):
+                self._sync_from_rig()
 
             if rot and not rot_was:
                 self.mapper.engage_rotation(s)

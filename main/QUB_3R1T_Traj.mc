@@ -1196,6 +1196,10 @@ SmState MainMachine {
 		// Tracked in every state, not just Teleop, so the panel can show
 		// whether the haptic PC is alive before anyone asks to use it.
 		TeleopFresh();
+		USER_PARAM(USR_POSE_PSI)     = Cpos(EE_PSI);
+		USER_PARAM(USR_POSE_PHI)     = Cpos(EE_PHI);
+		USER_PARAM(USR_POSE_THETA_N) = Cpos(EE_THETA_N);
+		USER_PARAM(USR_POSE_TOOL)    = Cpos(EE_TOOL);
 		USER_PARAM(USR_ERROR_NO)   = ErrorNo();
 		USER_PARAM(USR_ERROR_INFO) = ErrorInfo();
 

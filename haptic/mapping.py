@@ -167,14 +167,35 @@ def drag_band(demand: float, held: float, band: float) -> float:
     return held
 
 
-def _clamp(value: float, limit: float, name: str, hit: list) -> float:
-    if value > limit:
+def _clamp(value: float, limit: float, name: str, hit: list,
+           held: float = 0.0) -> float:
+    """Fence at +/-limit - but never pull back towards it.
+
+    After sync_from_rig the held value can already be OUTSIDE the fence: a
+    trajectory left theta_n at 200 deg, say. A plain clamp would turn the
+    first update into a 155 deg step back to the fence. Instead a held value
+    outside the fence becomes the fence on that side, so the operator can
+    come in from it freely and cannot go further out.
+    """
+    hi = max(limit, held)
+    lo = min(-limit, held)
+    if value > hi:
         hit.append(name)
-        return limit
-    if value < -limit:
+        return hi
+    if value < lo:
         hit.append(name)
-        return -limit
+        return lo
     return value
+
+
+def _unwrap_deg(angle: float, near: float) -> float:
+    """The equivalent of `angle` (mod 360) nearest to `near`.
+
+    The Euler decomposition only ever returns psi and theta_n in -180..180,
+    but the rig's theta_n runs to +/-720. Once the PC is synced to a pose
+    past 180 the raw decomposition would read as a 360 deg step.
+    """
+    return angle + 360.0 * round((near - angle) / 360.0)
 
 
 class PoseMap:
@@ -182,7 +203,8 @@ class PoseMap:
 
     Two independent clutches. Either, both or neither may be engaged, and
     the commanded pose persists across cycles - releasing freezes, the next
-    press continues from where it was left.
+    press continues from where it was left, or from where the rig actually
+    got to if the caller syncs it first (sync_from_rig).
     """
 
     def __init__(self, cfg: MapConfig | None = None):
@@ -199,6 +221,25 @@ class PoseMap:
         self._P0_dev = self._u_dev = None  # the same, device frame, for the wall
         self._tool0 = None
         self._s = 0.0
+
+    # ------------------------------------------------------- resync
+    def sync_from_rig(self, pose_deg, tool_mm) -> bool:
+        """Restart the commanded pose from where the rig actually is.
+
+        Releasing both clutches stops the rig where it has got to, which
+        after a fast move is short of what was commanded. The rig re-bases
+        on the next press from its real position; this makes the PC do the
+        same, so its fences and the haptic wall are measured from the real
+        pose and not from a target that was never reached.
+
+        Only while neither clutch is held - mid-follow, changing these would
+        be sent as a step. Returns whether it synced.
+        """
+        if self.rot_engaged or self.trans_engaged:
+            return False
+        self.pose_deg[:] = [float(v) for v in pose_deg]
+        self.tool_mm = float(tool_mm)
+        return True
 
     # ------------------------------------------------------ rotation clutch
     def engage_rotation(self, sample):
@@ -251,7 +292,10 @@ class PoseMap:
         if not self.trans_engaged:
             return (0.0, 0.0)
         r, lim = self.cfg.tool_ratio, self.cfg.tool_limit_mm
-        return (r * (-lim - self._tool0), r * (lim - self._tool0))
+        # Same never-pull-back rule as _clamp: a tool synced to outside the
+        # fence gets its wall where it already is, not behind the stylus.
+        lo, hi = min(-lim, self._tool0), max(lim, self._tool0)
+        return (r * (lo - self._tool0), r * (hi - self._tool0))
 
     # ----------------------------------------------------------- the mapping
     def update(self, sample) -> Command:
@@ -268,6 +312,8 @@ class PoseMap:
             dR = scale_rotation(R @ self._R0.T, 1.0 / cfg.angle_ratio)
             target = dR @ matrix_from_euler_xyz_deg(*self._pose0)
             (psi, phi, theta_n), locked = euler_xyz_deg(target)
+            psi     = _unwrap_deg(psi,     self.pose_deg[0])
+            theta_n = _unwrap_deg(theta_n, self.pose_deg[2])
 
             # Tremor first, fence second. The other way round, a hand
             # resting against the fence would have its jitter clamped to
@@ -277,16 +323,17 @@ class PoseMap:
             phi     = drag_band(phi,     self.pose_deg[1], band)
             theta_n = drag_band(theta_n, self.pose_deg[2], band)
 
-            psi     = _clamp(psi,     cfg.psi_limit_deg,     "psi",     hit)
-            phi     = _clamp(phi,     cfg.phi_limit_deg,     "phi",     hit)
-            theta_n = _clamp(theta_n, cfg.theta_n_limit_deg, "theta_n", hit)
+            held = self.pose_deg
+            psi     = _clamp(psi,     cfg.psi_limit_deg,     "psi",     hit, held[0])
+            phi     = _clamp(phi,     cfg.phi_limit_deg,     "phi",     hit, held[1])
+            theta_n = _clamp(theta_n, cfg.theta_n_limit_deg, "theta_n", hit, held[2])
             self.pose_deg[:] = (psi, phi, theta_n)
 
         if self.trans_engaged:
             P = self._A @ sample.position
             self._s = float((P - self._P0) @ self._u)
             tool = _clamp(self._tool0 + self._s / cfg.tool_ratio,
-                          cfg.tool_limit_mm, "tool", hit)
+                          cfg.tool_limit_mm, "tool", hit, self.tool_mm)
             self.tool_mm = tool
 
         return Command(psi, phi, theta_n, tool,

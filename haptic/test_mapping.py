@@ -260,6 +260,51 @@ def test_clamping():
     check("and says so", "psi" in cmd.clamped)
 
 
+# ------------------------------------------------------------ rig resync
+def test_sync_moves_the_wall_to_the_real_tool():
+    """The bug this exists for: commanded +15, rig stopped at +3."""
+    m = PoseMap(MapConfig(tool_ratio=3.0, tool_limit_mm=15.0))
+    m.engage_translation(FakeSample())
+    m.update(FakeSample(position=[0, 0, -45]))               # PC now says +15
+    m.release_translation()
+    check("accepted with no clutch held", m.sync_from_rig((0, 0, 0), 3.0))
+    m.engage_translation(FakeSample())
+    lo, hi = m.travel_limits_mm()
+    check(f"36 mm of forward stylus travel left, not 0 ({hi:.1f})",
+          abs(hi - 36.0) < 1e-9 and abs(lo + 54.0) < 1e-9)
+
+
+def test_sync_refused_while_engaged():
+    m = PoseMap()
+    m.engage_rotation(FakeSample())
+    check("sync refused with a clutch held",
+          not m.sync_from_rig((10, 0, 0), 5.0))
+    check("and nothing changed",
+          abs(m.pose_deg[0]) < 1e-12 and abs(m.tool_mm) < 1e-12)
+
+
+def test_synced_outside_the_fence_does_not_snap_back():
+    m = PoseMap(MapConfig(angle_ratio=1.0, tremor_deg=0.0, theta_n_limit_deg=45.0))
+    m.sync_from_rig((0, 0, 60.0), 0.0)                      # a MOVE left it at 60
+    m.engage_rotation(FakeSample())
+    held = m.update(FakeSample()).theta_n_deg
+    check(f"engage holds 60, no step to the 45 fence ({held:.3f})",
+          abs(held - 60.0) < 1e-9)
+    out = m.update(FakeSample(rotation=_turn(5, [0, 0, 1]))).theta_n_deg
+    check("cannot go further out", abs(out - 60.0) < 1e-9)
+    back = m.update(FakeSample(rotation=_turn(-10, [0, 0, 1]))).theta_n_deg
+    check("can come back in", abs(back - 50.0) < 1e-6)
+
+
+def test_synced_past_180_does_not_wrap():
+    m = PoseMap(MapConfig(angle_ratio=1.0, tremor_deg=0.0, theta_n_limit_deg=720.0))
+    m.sync_from_rig((0, 0, 200.0), 0.0)
+    m.engage_rotation(FakeSample())
+    cmd = m.update(FakeSample(rotation=_turn(3, [0, 0, 1])))
+    check(f"theta_n 200 + 3 reads 203, not -157 ({cmd.theta_n_deg:.3f})",
+          abs(cmd.theta_n_deg - 203.0) < 1e-6)
+
+
 if __name__ == "__main__":
     print("\n  mapping self-test\n")
     for fn in [test_convention, test_roundtrip, test_gimbal_lock_flagged,
@@ -275,7 +320,11 @@ if __name__ == "__main__":
                test_drag_band_zero_is_off,
                test_tremor_suppresses_jitter_through_the_mapper,
                test_tremor_applied_before_the_fence,
-               test_clamping]:
+               test_clamping,
+               test_sync_moves_the_wall_to_the_real_tool,
+               test_sync_refused_while_engaged,
+               test_synced_outside_the_fence_does_not_snap_back,
+               test_synced_past_180_does_not_wrap]:
         print(f"\n  {fn.__name__}")
         fn()
     print("\n  all checks passed\n")
