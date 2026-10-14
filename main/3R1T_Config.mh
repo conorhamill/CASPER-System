@@ -249,10 +249,14 @@
 // mechanism cannot reach protects nothing and the carriage finds its hard
 // stop instead.
 //
+// 2026-10-14: widened from +/-15 to +/-20 mm, the usable travel each way.
+// The haptic program reads this figure for its own fence and wall, so the
+// two cannot drift apart.
+//
 // The tilt compensation is NOT counted here - it is added downstream in
 // InverseKinematics1T and holds the rail still through a tilt, so this
 // bounds the tool COMMAND on its own. See 3R1T_Kin_1T.mh.
-#define LIM_TOOL_MM100		1500		// +/- 15.00 mm - the rail's travel
+#define LIM_TOOL_MM100		2000		// +/- 20.00 mm - the rail's travel
 
 
 ///////////////////////////////////////////////////////////////////////////

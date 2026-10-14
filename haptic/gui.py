@@ -133,6 +133,7 @@ class Worker(threading.Thread):
         self.stop_flag = threading.Event()
         self.mapper = PoseMap(cfg)
         self.wall_on = False
+        self.lock_on = True           # pen lock while rotating, see wall.py
         self._dev: Touch | None = None
         self._macs: MacsTcp | None = None
         # Neither device is addressed by a COM port. The Touch is found by
@@ -194,6 +195,7 @@ class Worker(threading.Thread):
                            "check its power supply, it is separate from USB")
             return
         self._dev = dev
+        dev.lock_enabled = self.lock_on
         info = dev.info
         self._set(touch_id=f"{info['model']} {info['serial']}")
         # The insertion wall is ON from the start. It is the only fence the
@@ -323,6 +325,23 @@ class Worker(threading.Thread):
                                    f"tremor {tremor/100:.2f} deg")
                 elif name == "wall":
                     self._set_wall(bool(value))
+                elif name == "lock":
+                    self.lock_on = bool(value)
+                    if self._dev is not None:
+                        self._dev.lock_enabled = self.lock_on
+                    self._set(note="pen lock "
+                                   + ("ON" if self.lock_on else "off"))
+                    if self._dev is not None:
+                        self._apply_guides(self._dev.snapshot())
+                elif name == "hinge":
+                    # The mapper tracks both turn sources every cycle, so
+                    # this is safe mid-stroke; the guide is re-picked now.
+                    self.cfg.hinge_workaround = bool(value)
+                    self._set(note="broken-hinge mode "
+                                   + ("ON - joint lock, one Touch joint per axis"
+                                      if value else "off - pen orientation"))
+                    if self._dev is not None:
+                        self._apply_guides(self._dev.snapshot())
                 elif name == "connect_macs":
                     self.macs_addr = value
                     self._connect_macs()
@@ -343,11 +362,44 @@ class Worker(threading.Thread):
                                      max_force=wallmod.DEFAULT_MAX_FORCE)
             self._dev.enable_force()
             self._dev.start_wall_loop()
+            self.wall_on = True
+            # Switched on with a clutch already held: guide it now rather
+            # than at the next press.
+            self._apply_guides(self._dev.snapshot())
             self._set(note="force output ENABLED")
         else:
             self._dev.stop_wall_loop()
             self._set(note="force wound down")
         self.wall_on = want
+
+    def _apply_guides(self, s):
+        """Pick the force guide for the clutches now held. See wall.py.
+
+        Translation held -> the END WALLS only, anchored where translation
+                            engaged. The pen is otherwise free.
+        Rotation alone   -> the LOCK, anchored where the pen is NOW - so
+                            letting go of translation mid-stroke locks the
+                            pen where it was left, not back at the start.
+                            In broken-hinge mode it is the JOINT lock: arm
+                            joints 1 and 2 held, the elbow free, so up/down
+                            comes through the elbow (see MapConfig).
+        Neither          -> off, decaying through the rate limiter.
+        """
+        if not self.wall_on or self._dev is None:
+            return
+        m = self.mapper
+        if m.trans_engaged:
+            lo, hi = m.travel_limits_mm()
+            self._dev.set_wall(m.wall_anchor_device, m.wall_axis_device, lo, hi)
+        elif m.rot_engaged and self.cfg.hinge_workaround:
+            if self.lock_on:
+                self._dev.set_joint_lock(s.joints, (True, True, False))
+            else:
+                self._dev.clear_wall()
+        elif m.rot_engaged:
+            self._dev.set_lock(s.position)     # does nothing unless lock_enabled
+        else:
+            self._dev.clear_wall()
 
     def _sync_from_rig(self):
         """Take the rig's actual pose as the PC's, if the rig is about to
@@ -410,14 +462,10 @@ class Worker(threading.Thread):
                 self.mapper.release_rotation()
             if tra and not tra_was:
                 self.mapper.engage_translation(s)
-                if self.wall_on:
-                    lo, hi = self.mapper.travel_limits_mm()
-                    self._dev.set_wall(self.mapper.wall_anchor_device,
-                                       self.mapper.wall_axis_device, lo, hi)
             elif tra_was and not tra:
                 self.mapper.release_translation()
-                if self.wall_on:
-                    self._dev.clear_wall()
+            if (rot, tra) != (rot_was, tra_was):
+                self._apply_guides(s)
 
             cmd = self.mapper.update(s)
             n += 1
@@ -596,6 +644,19 @@ class App:
                         variable=self.wall_var,
                         command=self.toggle_wall).grid(
             row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 2))
+        self.lock_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(box, text="pen lock: hold the pen still while rotating",
+                        variable=self.lock_var,
+                        command=self.toggle_lock).grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 2))
+        # TEMPORARY - until the Touch's wrist pitch sensor is repaired. See
+        # MapConfig.hinge_workaround. Untick once it is back.
+        self.hinge_var = tk.BooleanVar(value=cfg.hinge_workaround)
+        ttk.Checkbutton(box, text="broken-hinge mode: joint lock, up/down from "
+                                  "the elbow (until the Touch is repaired)",
+                        variable=self.hinge_var,
+                        command=self.toggle_hinge).grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 2))
 
         # ---- buttons ----------------------------------------------------
         bar = ttk.Frame(root)
@@ -653,6 +714,12 @@ class App:
 
     def toggle_wall(self):
         self.worker.send_command("wall", int(self.wall_var.get()))
+
+    def toggle_lock(self):
+        self.worker.send_command("lock", int(self.lock_var.get()))
+
+    def toggle_hinge(self):
+        self.worker.send_command("hinge", int(self.hinge_var.get()))
 
     def reconnect(self):
         """Drop both devices and open them again with whatever is typed.
@@ -723,7 +790,9 @@ class App:
 
 
 def main() -> int:
-    cfg = MapConfig.from_config_mh(CONFIG_MH)
+    # Broken-hinge mode ON by default while this Touch's wrist pitch sensor
+    # is dead (2026-10-14). Set False here once it is repaired.
+    cfg = MapConfig.from_config_mh(CONFIG_MH, hinge_workaround=True)
     shared = Shared()
     worker = Worker(shared, cfg)
     worker.start()

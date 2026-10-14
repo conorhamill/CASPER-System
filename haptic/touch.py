@@ -2,8 +2,9 @@
 ctypes binding for the OpenHaptics HD API, for the 3D Systems Touch.
 
 Force output is OFF unless enable_force() is called explicitly, so reading
-is always safe and the arm stays limp. Once enabled, the only thing that
-ever commands force is the wall in wall.py, driven from the servo thread.
+is always safe and the arm stays limp. Once enabled, the only things that
+ever command force are the guides in wall.py - the end walls, and the pen
+lock if lock_enabled is set - driven from the servo thread.
 
 Needs the OpenHaptics toolkit (hd.dll, which the installer puts in System32)
 and the Touch Device Drivers.
@@ -46,6 +47,10 @@ NOMINAL_MAX_FORCE      = 0x2603
 NOMINAL_MAX_CONT_FORCE = 0x2604
 NOMINAL_MAX_DAMPING    = 0x2609
 CURRENT_FORCE          = 0x2700
+# Torques on the first three (arm) joints [mNm]. Setting it OVERRIDES
+# CURRENT_FORCE for that frame (OpenHaptics 3.5 programmer's guide), so a
+# frame sets one or the other, never both.
+CURRENT_JOINT_TORQUE   = 0x2703
 # Enable/disable CAPABILITIES - not settable values. hdSetDoublev on one of
 # these returns HD_INVALID_ENUM.
 FORCE_OUTPUT           = 0x4000
@@ -63,6 +68,10 @@ CALIBRATION_NAMES = {0x5000: "OK", 0x5001: "NEEDS_UPDATE", 0x5002: "NEEDS_MANUAL
 STYLE_NAMES       = {1: "ENCODER_RESET", 2: "AUTO", 4: "INKWELL"}
 
 _PRIORITY = 0xFFFF // 2                      # HD_DEFAULT_SCHEDULER_PRIORITY
+
+# Guide modes. See wall.py.
+_OFF, _LOCK, _WALL, _JLOCK = 0, 1, 2, 3
+_GUIDE_OFF = (_OFF, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 class HDErrorInfo(C.Structure):
@@ -142,23 +151,36 @@ class Touch:
         self._btn = C.c_int()
         self._cal = C.c_uint()
         self._force = (C.c_double * 3)()
+        self._torque = (C.c_double * 3)()
         self._cb  = _CALLBACK(self._sample_in_servo_thread)   # keep a reference alive
         self._wall_cb = _CALLBACK(self._wall_in_servo_thread)
         self._wall_handle = None
         self._force_enabled = False
-        # Wall state. Plain floats rather than arrays so the servo thread
-        # never sees a half-written vector, and so the callback allocates
-        # nothing at 1 kHz.
-        self._wall_on = False
-        self._w_p0x = self._w_p0y = self._w_p0z = 0.0
-        self._w_ux = self._w_uy = self._w_uz = 0.0
-        self._w_lo = self._w_hi = 0.0
+        # Guide state: (mode, anchor xyz, axis xyz, lo, hi) as ONE tuple.
+        # The main thread replaces it whole and the servo thread reads it
+        # once per tick, so the servo thread can never see a mode from one
+        # call with an anchor from another.
+        self._g = _GUIDE_OFF
+        # The pen lock. Off unless asked for, so the stage scripts keep the
+        # plain end walls they were written for.
+        self.lock_enabled = False
         self._w_k = wall.DEFAULT_STIFFNESS
         self._w_b = wall.DEFAULT_DAMPING
         self._w_fmax = wall.DEFAULT_MAX_FORCE
+        self._l_k = wall.DEFAULT_LOCK_STIFFNESS
+        self._l_b = wall.DEFAULT_LOCK_DAMPING
+        self._l_fmax = wall.DEFAULT_LOCK_MAX_FORCE
         self._w_step = 0.05          # [N] per tick, ~60 ms to full scale
-        self._w_force = 0.0          # last applied, along the axis
+        self._fx = self._fy = self._fz = 0.0   # last applied force vector
+        self._w_force = 0.0          # end-wall force along the axis, for display
         self._w_s = 0.0              # last travel, for display
+        # The joint lock - see wall.joint_lock_torque.
+        self._j_k = wall.DEFAULT_JOINT_STIFFNESS
+        self._j_tmax = wall.DEFAULT_JOINT_MAX_TORQUE
+        self._j_sign = 1.0
+        self._j_step = 2.0           # [mNm] per tick, ~60 ms to full scale
+        self._t1 = self._t2 = self._t3 = 0.0   # last applied joint torques
+        self.joint_lock_tripped = False
 
     # -------------------------------------------------------------- lifetime
     def _drain(self) -> list:
@@ -337,34 +359,66 @@ class Touch:
             self._w_fmax = max_force
 
     def set_wall(self, anchor, axis, lo: float, hi: float):
-        """Place the wall. Called from the main thread on a clutch press.
+        """The END WALLS at lo/hi along the axis; free in every other
+        direction. Called from the main thread on a translation clutch press.
 
         anchor/axis are in the DEVICE frame - the servo thread works in raw
         device coordinates and knows nothing about the robot's base frame.
         """
-        self._w_p0x, self._w_p0y, self._w_p0z = (float(v) for v in anchor)
-        self._w_ux, self._w_uy, self._w_uz    = (float(v) for v in axis)
-        self._w_lo, self._w_hi = float(lo), float(hi)
-        self._wall_on = True
+        ax, ay, az = (float(v) for v in anchor)
+        ux, uy, uz = (float(v) for v in axis)
+        self._g = (_WALL, ax, ay, az, ux, uy, uz, float(lo), float(hi))
+
+    def set_lock(self, anchor):
+        """The LOCK: hold the pen's position at `anchor` (device frame) so
+        only its orientation can change. Does nothing unless lock_enabled."""
+        ax, ay, az = (float(v) for v in anchor)
+        self._g = (_LOCK, ax, ay, az, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    def set_joint_lock(self, joints_rad, locked=(True, True, False)):
+        """The JOINT lock: hold the chosen ARM joints at `joints_rad` with
+        springs, leave the others free. Default: hold joints 1 and 2, free
+        joint 3, so the pen's position can only swing about the elbow.
+
+        Applies whether or not lock_enabled is set - it is asked for
+        explicitly. Drops itself (joint_lock_tripped) if a held joint gets
+        more than wall.JOINT_LOCK_TRIP_RAD from its anchor."""
+        j1, j2, j3 = (float(v) for v in joints_rad)
+        m1, m2, m3 = (1.0 if b else 0.0 for b in locked)
+        self.joint_lock_tripped = False
+        self._g = (_JLOCK, j1, j2, j3, m1, m2, m3, 0.0, 0.0)
 
     def clear_wall(self):
-        """Stop commanding wall force. The rate limiter decays it to zero
+        """Stop commanding guide force. The rate limiter decays it to zero
         rather than dropping it, so releasing the clutch is not a step."""
-        self._wall_on = False
+        self._g = _GUIDE_OFF
+
+    @property
+    def joint_torque_mnm(self) -> tuple:
+        """The joint torques actually being applied [mNm]."""
+        return (self._t1, self._t2, self._t3)
 
     @property
     def wall_force_n(self) -> float:
+        """End-wall force along the axis. Not the lock - see force_n for
+        everything."""
         return self._w_force
+
+    @property
+    def force_n(self) -> float:
+        """Magnitude of the force actually being applied."""
+        return (self._fx * self._fx + self._fy * self._fy
+                + self._fz * self._fz) ** 0.5
 
     @property
     def wall_s_mm(self) -> float:
         return self._w_s
 
     def _wall_in_servo_thread(self, _):
-        """The 1 kHz loop. Reads state, renders the wall, applies the force.
+        """The 1 kHz loop. Reads state, renders the guides, applies the force.
 
-        No allocation, no numpy, no I/O, no exceptions - this runs 1000
-        times a second inside the driver.
+        No numpy, no I/O, no exceptions - this runs 1000 times a second
+        inside the driver.
         """
         hd  = self._hd
         hhd = hd.hdGetCurrentDevice()
@@ -377,24 +431,62 @@ class Touch:
         hd.hdGetDoublev(UPDATE_RATE_INSTANT,   self._rate)
         hd.hdGetIntegerv(CURRENT_BUTTONS, C.byref(self._btn))
 
-        if self._wall_on:
-            ux, uy, uz = self._w_ux, self._w_uy, self._w_uz
-            s = ((self._pos[0] - self._w_p0x) * ux
-                 + (self._pos[1] - self._w_p0y) * uy
-                 + (self._pos[2] - self._w_p0z) * uz)
-            s_dot = self._vel[0] * ux + self._vel[1] * uy + self._vel[2] * uz
-            self._w_s = s
-            target = wall.wall_force(s, self._w_lo, self._w_hi,
-                                     self._w_k, self._w_b, s_dot, self._w_fmax)
+        mode, ax, ay, az, ux, uy, uz, lo, hi = self._g     # one read
+        q1 = q2 = q3 = 0.0                                   # joint torque targets
+        if mode == _WALL:
+            tx, ty, tz, self._w_s, self._w_force = wall.end_wall_force(
+                self._pos[0] - ax, self._pos[1] - ay, self._pos[2] - az,
+                self._vel[0], self._vel[1], self._vel[2],
+                ux, uy, uz, lo, hi,
+                self._w_k, self._w_b, self._w_fmax)
+        elif mode == _LOCK and self.lock_enabled:
+            tx, ty, tz = wall.lock_force(
+                self._pos[0] - ax, self._pos[1] - ay, self._pos[2] - az,
+                self._vel[0], self._vel[1], self._vel[2],
+                self._l_k, self._l_b, self._l_fmax)
+            self._w_force = 0.0
         else:
-            target = 0.0
+            tx = ty = tz = 0.0
+            self._w_force = 0.0
+            if mode == _JLOCK:
+                # (ax, ay, az) are the joint anchors, (ux, uy, uz) the masks.
+                e1, e2, e3 = self._jnt[0] - ax, self._jnt[1] - ay, self._jnt[2] - az
+                trip = wall.JOINT_LOCK_TRIP_RAD
+                if ((ux and abs(e1) > trip) or (uy and abs(e2) > trip)
+                        or (uz and abs(e3) > trip)):
+                    self.joint_lock_tripped = True
+                    self._g = _GUIDE_OFF
+                else:
+                    q1, q2, q3 = wall.joint_lock_torque(
+                        e1, e2, e3, ux, uy, uz, self._j_k, self._j_tmax, self._j_sign)
 
-        f = wall.rate_limit(target, self._w_force, self._w_step)
-        self._w_force = f
-        self._force[0] = f * self._w_ux
-        self._force[1] = f * self._w_uy
-        self._force[2] = f * self._w_uz
-        hd.hdSetDoublev(CURRENT_FORCE, self._force)
+        # >>> ONE OUTPUT PER FRAME, AND HAND OVER THROUGH ZERO. <<<
+        # Joint torque overrides force for the frame it is set in. So while
+        # any force is still applied the joint torques are held at zero and
+        # force is sent; while any joint torque is still applied the force
+        # is held at zero and torque is sent. Each ramps down before the
+        # other ramps up, and neither can ever be dropped as a step.
+        torque_live = (self._t1 or self._t2 or self._t3)
+        force_live = (self._fx or self._fy or self._fz)
+        if torque_live or (not force_live and (q1 or q2 or q3)):
+            tx = ty = tz = 0.0
+            self._fx = self._fy = self._fz = 0.0      # nothing is being sent
+            s = self._j_step
+            self._t1 = wall.rate_limit(q1, self._t1, s)
+            self._t2 = wall.rate_limit(q2, self._t2, s)
+            self._t3 = wall.rate_limit(q3, self._t3, s)
+            self._torque[0] = self._t1
+            self._torque[1] = self._t2
+            self._torque[2] = self._t3
+            hd.hdSetDoublev(CURRENT_JOINT_TORQUE, self._torque)
+        else:
+            fx, fy, fz = wall.rate_limit_vec(tx, ty, tz,
+                                             self._fx, self._fy, self._fz, self._w_step)
+            self._fx, self._fy, self._fz = fx, fy, fz
+            self._force[0] = fx
+            self._force[1] = fy
+            self._force[2] = fz
+            hd.hdSetDoublev(CURRENT_FORCE, self._force)
         hd.hdEndFrame(hhd)
         return HD_CALLBACK_CONTINUE
 
@@ -408,9 +500,10 @@ class Touch:
         released mid-push."""
         if self._wall_handle is None:
             return
-        self._wall_on = False
+        self._g = _GUIDE_OFF
         deadline = time.perf_counter() + 0.5
-        while abs(self._w_force) > 1e-3 and time.perf_counter() < deadline:
+        while ((self.force_n > 1e-3 or self._t1 or self._t2 or self._t3)
+               and time.perf_counter() < deadline):
             time.sleep(0.005)
         self._hd.hdUnschedule(self._wall_handle)
         self._wall_handle = None

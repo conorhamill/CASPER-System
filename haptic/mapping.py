@@ -7,20 +7,47 @@ Orientation
     by the 1T solver. scipy spells that convention "XYZ" (uppercase means
     intrinsic), so the two agree by construction here.
 
-    The Touch and the robot base are assumed to have IDENTICAL orientation.
-    If the device is ever moved, put the alignment rotation in MapConfig
-    rather than fixing it up downstream.
+    >>> TIP UP IS +PSI, TIP RIGHT IS +PHI, TWIST IS THETA_N. <<<
 
-    Orientation is CLUTCHED, on its own button. On engage we capture the
-    stylus rotation and the robot pose; thereafter only the delta is
-    applied. That matters for more than ergonomics: 3R1T_Kin_3R.mh warns
-    that its continuity tracker picks whichever IK branch is nearer to last
-    cycle's answer, so a step input makes it confidently return the wrong
-    pose. Clutching means engaging never produces a step.
+    Orientation is CLUTCHED, on its own button, and on every press the pen
+    counts as being at zero wherever it is held. From then on, each cycle's
+    turn of the pen (a rotation - scipy holds it as a quaternion) is split
+    three ways:
 
-    The delta is scaled in AXIS-ANGLE, not by halving the three Euler terms
-    separately. Those are not the same operation and they diverge badly by
-    the time the wrist is 60 degrees over.
+        tip moving up / down        as seen from in front of the Touch   psi
+        tip moving right / left     as seen from in front of the Touch   phi
+        twist about the pen's own long axis                          theta_n
+
+    and each part is added to its angle. That matches the rig as seen from
+    the operator's side of the bench (measured 2026-10-14): +psi tilts the
+    needle up, +phi tilts it right.
+
+    >>> UP AND RIGHT ARE THE ROOM'S, NOT THE PEN'S. <<<
+    The first version of this measured tip movement about the pen's own
+    axes and applied it about the platform's own axes. Twist was right, but
+    which way counted as "left" then depended on how the pen happened to be
+    rolled in the fingers and how far theta_n had been spun - left/right
+    came out as up/down. So up/down and left/right are taken against the
+    Touch's own X (to the right), whatever the pen's roll or theta_n.
+
+    It ADDS UP SMALL TURNS, one per cycle, rather than measuring the total
+    turn since the press. The point is the fences: the overshoot past a
+    limit is thrown away as it happens, so reversing moves the platform
+    straight off the limit instead of first having to unwind the overshoot.
+    The cost is path dependence - wave the pen in a loop and come back, and
+    the platform ends a hair from where it started. Nobody can feel it, and
+    with every press starting from zero there is no "home" for the pen to
+    come back to anyway.
+
+    >>> BROKEN-HINGE MODE (MapConfig.hinge_workaround) <<<
+    This Touch's wrist pitch sensor is dead, so while it is away for repair
+    the three parts come from three Touch joints instead of the pen's
+    orientation. See MapConfig for the figures and where they came from.
+
+    Engaging never produces a step, which matters for more than ergonomics:
+    3R1T_Kin_3R.mh warns that its continuity tracker picks whichever IK
+    branch is nearer to last cycle's answer, so a step input makes it
+    confidently return the wrong pose.
 
 Translation
     Clutched on a SEPARATE button, so the tool can be aimed without being
@@ -56,8 +83,8 @@ class MapConfig:
     # Robot fences. These mirror LIM_* in 3R1T_Config.mh; keep them in step.
     psi_limit_deg:     float = 30.0
     phi_limit_deg:     float = 30.0
-    theta_n_limit_deg: float = 45.0
-    tool_limit_mm:     float = 15.0
+    theta_n_limit_deg: float = 90.0     # PC-only fence; the rig allows +/-720
+    tool_limit_mm:     float = 20.0
 
     # Tremor band for the three angles, in degrees. A hand holding a stylus
     # still is not still. Comes from USR_TELE_TREMOR so the panel can change
@@ -69,8 +96,46 @@ class MapConfig:
     # stylus pointing away from you, and see which axis follows it.
     stylus_axis: tuple = (0.0, 0.0, -1.0)
 
-    # Fixed rotation from device world frame to robot base frame.
+    # Fixed rotation from device world frame to robot base frame. Used by
+    # TRANSLATION only - rotation is split into tip up / tip right / twist
+    # and needs no frame of its own.
     align: tuple = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+    # Direction of each part of the pen's turn: (tip up -> psi, tip right ->
+    # phi, twist -> theta_n). +1 or -1. Set from the rig on 2026-10-14; if a
+    # direction ever comes out backwards, flip it here and nowhere else.
+    turn_signs: tuple = (1.0, 1.0, 1.0)
+
+    # >>> BROKEN-HINGE MODE. TEMPORARY, UNTIL THE TOUCH IS REPAIRED. <<<
+    #
+    # This Touch's wrist pitch sensor reads a constant 45 deg (found
+    # 2026-10-14), so the pen's orientation as the device reports it is
+    # wrong whenever the hinge is anywhere else, and up/down can only come
+    # from swinging the forearm. In this mode the turn is read straight off
+    # three Touch joints instead of the pen's orientation:
+    #
+    #     up     = joint_gains[0] x change of arm joint 3 (the elbow)
+    #     right  = joint_gains[1] x change of wrist joint 1
+    #     twist  = joint_gains[2] x (change of wrist joint 3
+    #                                - twist_coupling x change of wrist joint 1)
+    #
+    # and the GUI holds arm joints 1 and 2 while the rotation clutch is
+    # down, so the forearm can only swing about the elbow.
+    #
+    # Every figure here was fitted from lock_probe_joint.csv (firm joint
+    # lock, 2026-10-14), against the orientation mapping as the reference
+    # for direction and size:
+    #     up    = -0.86 x d(joint 3), corr -0.99 - taken as -1.0, since 1 deg
+    #             of forearm is 1 deg of tip
+    #     right = -0.62 x d(wrist 1), corr -0.99
+    #     twist = -0.99 x d(wrist 3 - 0.40 wrist 1), corr -1.00
+    #     wrist 3 moves +0.40 deg per deg of wrist 1 during left/right: the
+    #     stuck hinge makes a left/right swing drag the twist joint with it
+    # With these, left/right lands 86% on phi (48% from orientation) and
+    # up/down 67% on psi (49%). Twist is 82% either way.
+    hinge_workaround: bool = False
+    joint_gains: tuple = (-1.0, -0.62, -1.0)
+    twist_coupling: float = 0.40
 
     @classmethod
     def from_config_mh(cls, path, **overrides) -> "MapConfig":
@@ -133,14 +198,72 @@ def matrix_from_euler_xyz_deg(psi: float, phi: float, theta_n: float) -> np.ndar
     return Rotation.from_euler("XYZ", [psi, phi, theta_n], degrees=True).as_matrix()
 
 
-def scale_rotation(R: np.ndarray, factor: float) -> np.ndarray:
-    """Take `factor` times the rotation R, about the same axis.
+# The Touch's +X: to the right, seen from in front of the device.
+_ROOM_RIGHT = np.array([1.0, 0.0, 0.0])
+_ROOM_TOWARD_USER = np.array([0.0, 0.0, 1.0])
 
-    Axis-angle is the only form in which "half a rotation" means what it
-    sounds like. Scaling Euler angles individually is a different operation
-    that happens to agree near zero.
+
+def split_turn(R_prev: np.ndarray, R_now: np.ndarray, right_prev=None,
+               tip_axis=(0.0, 0.0, -1.0)):
+    """Split the pen's turn from R_prev to R_now into (up, right, twist) [deg].
+
+        up      the tip moving up        - turn about the room's right axis,
+                                           squared off against the pen
+        right   the tip moving right     - turn about the axis at right
+                                           angles to that and to the pen
+        twist   about the pen's own long axis, positive the way the right
+                hand curls with the thumb pointing BACK up the pen (away
+                from the tip). tip_axis is MapConfig.stylus_axis.
+
+    The three axes are at right angles, so the three parts add back up to
+    the whole turn. They are meant for the small turn of one 10 ms cycle;
+    for a big turn the split is only approximate.
+
+    Also returns the right axis used, to pass back as `right_prev` next
+    cycle. Only the pen pointing almost straight left or right leaves the
+    room's right axis undefined, and then the last one is reused.
     """
-    return Rotation.from_rotvec(Rotation.from_matrix(R).as_rotvec() * factor).as_matrix()
+    w = Rotation.from_matrix(R_now @ R_prev.T).as_rotvec()     # room frame [rad]
+    d = R_prev @ np.asarray(tip_axis, dtype=float)             # where the tip points
+    d = d / np.linalg.norm(d)
+    z = -d
+    x = _ROOM_RIGHT - (_ROOM_RIGHT @ d) * d
+    n = float(np.linalg.norm(x))
+    if n < 0.3:
+        if right_prev is not None:
+            x = np.asarray(right_prev, dtype=float)
+        else:
+            # No history either: square off against "toward the user"
+            # instead, which the pen cannot also be pointing along.
+            x = np.cross(_ROOM_TOWARD_USER, d)
+            x = x / np.linalg.norm(x)
+    else:
+        x = x / n
+    a = np.cross(d, x)            # turning about this moves the tip towards +x
+    up, right, twist = np.degrees([w @ x, w @ a, w @ z])
+    return float(up), float(right), float(twist), x
+
+
+def _wrap_deg(d: float) -> float:
+    """A joint step folded into -180..180, so a joint reading that wraps
+    round from +180 to -180 reads as a small step and not a whole turn."""
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def joint_turn(joints_prev, gimbal_prev, joints_now, gimbal_now,
+               gains=(-1.0, -0.62, -1.0), coupling=0.40):
+    """The broken-hinge mode's (up, right, twist) [deg] - see MapConfig.
+
+    joints are the Touch's three ARM joint angles, gimbal its three WRIST
+    joint angles, both in radians as the device reports them.
+    """
+    d_elbow = _wrap_deg(np.degrees(joints_now[2] - joints_prev[2]))
+    d_w1    = _wrap_deg(np.degrees(gimbal_now[0] - gimbal_prev[0]))
+    d_w3    = _wrap_deg(np.degrees(gimbal_now[2] - gimbal_prev[2]))
+    g_up, g_right, g_twist = gains
+    return (float(g_up * d_elbow),
+            float(g_right * d_w1),
+            float(g_twist * (d_w3 - coupling * d_w1)))
 
 
 def drag_band(demand: float, held: float, band: float) -> float:
@@ -188,16 +311,6 @@ def _clamp(value: float, limit: float, name: str, hit: list,
     return value
 
 
-def _unwrap_deg(angle: float, near: float) -> float:
-    """The equivalent of `angle` (mod 360) nearest to `near`.
-
-    The Euler decomposition only ever returns psi and theta_n in -180..180,
-    but the rig's theta_n runs to +/-720. Once the PC is synced to a pose
-    past 180 the raw decomposition would read as a 360 deg step.
-    """
-    return angle + 360.0 * round((near - angle) / 360.0)
-
-
 class PoseMap:
     """Holds the commanded robot pose and advances it from stylus motion.
 
@@ -216,7 +329,15 @@ class PoseMap:
         self.tool_mm  = 0.0
         self.rot_engaged   = False
         self.trans_engaged = False
-        self._R0 = self._pose0 = None    # rotation clutch anchors
+        # Rotation clutch state. _R_prev is the pen last cycle, so each
+        # cycle's turn is measured against it. _raw is what the turns add up
+        # to BEFORE the tremor band - see update(). _right is split_turn's
+        # last right axis.
+        self._R_prev = None
+        self._right = None
+        self._raw = np.zeros(3)
+        # The same for broken-hinge mode: last cycle's arm and wrist joints.
+        self._j_prev = self._g_prev = None
         self._P0 = self._u = None        # translation clutch anchors, base frame
         self._P0_dev = self._u_dev = None  # the same, device frame, for the wall
         self._tool0 = None
@@ -243,12 +364,24 @@ class PoseMap:
 
     # ------------------------------------------------------ rotation clutch
     def engage_rotation(self, sample):
-        self._R0    = self._A @ sample.rotation
-        self._pose0 = self.pose_deg.copy()
+        # The pen counts as zero from here: only turns from now on count.
+        self._R_prev = np.asarray(sample.rotation, dtype=float)
+        self._right = None
+        self._j_prev, self._g_prev = self._joints_of(sample)
+        self._raw = self.pose_deg.copy()
         self.rot_engaged = True
 
     def release_rotation(self):
         self.rot_engaged = False
+
+    @staticmethod
+    def _joints_of(sample):
+        """The sample's arm and wrist joints, or (None, None) for a sample
+        that does not carry them (the tests' fakes)."""
+        j, g = getattr(sample, "joints", None), getattr(sample, "gimbal", None)
+        if j is None or g is None:
+            return None, None
+        return np.array(j, dtype=float), np.array(g, dtype=float)
 
     # --------------------------------------------------- translation clutch
     def engage_translation(self, sample):
@@ -306,24 +439,56 @@ class PoseMap:
         tool = self.tool_mm
 
         if self.rot_engaged:
-            R = self._A @ sample.rotation
-            # Delta in the world/base frame, so a wrist rotation about base X
-            # becomes a platform rotation about base X.
-            dR = scale_rotation(R @ self._R0.T, 1.0 / cfg.angle_ratio)
-            target = dR @ matrix_from_euler_xyz_deg(*self._pose0)
-            (psi, phi, theta_n), locked = euler_xyz_deg(target)
-            psi     = _unwrap_deg(psi,     self.pose_deg[0])
-            theta_n = _unwrap_deg(theta_n, self.pose_deg[2])
+            R = np.asarray(sample.rotation, dtype=float)
+            # This cycle's turn of the pen, split into tip up / tip right /
+            # twist, each scaled and added to its own angle. Added straight
+            # onto the angles, so theta_n counts on past 180 with no wrap.
+            #
+            # Both sources are tracked every cycle, whichever is in use, so
+            # the mode can be switched mid-stroke without a jump.
+            up, right, twist, self._right = split_turn(
+                self._R_prev, R, self._right, cfg.stylus_axis)
+            self._R_prev = R
+            j, g = self._joints_of(sample)
+            if cfg.hinge_workaround:
+                if self._j_prev is not None and j is not None:
+                    up, right, twist = joint_turn(self._j_prev, self._g_prev, j, g,
+                                                  cfg.joint_gains, cfg.twist_coupling)
+                else:
+                    up = right = twist = 0.0          # no joints yet: hold
+                # Pushing the pen along its axis swings the elbow too, so
+                # with the translation clutch also held the elbow is not
+                # up/down. Hold psi while translating.
+                if self.trans_engaged:
+                    up = 0.0
+            self._j_prev, self._g_prev = j, g
+            k = 1.0 / cfg.angle_ratio
+            su, sr, st = cfg.turn_signs
+            rp = self._raw[0] + su * up    * k
+            rh = self._raw[1] + sr * right * k
+            rn = self._raw[2] + st * twist * k
 
-            # Tremor first, fence second. The other way round, a hand
-            # resting against the fence would have its jitter clamped to
-            # the limit and then let straight through as movement.
-            band    = cfg.tremor_deg
-            psi     = drag_band(psi,     self.pose_deg[0], band)
-            phi     = drag_band(phi,     self.pose_deg[1], band)
-            theta_n = drag_band(theta_n, self.pose_deg[2], band)
+            # >>> THE TREMOR BAND WORKS ON THE TOTAL, NOT ON EACH TURN. <<<
+            # A turn per 10 ms cycle is far smaller than a 1 deg band, so a
+            # band applied per turn would throw away every slow movement.
+            # So the turns add up in _raw, unfiltered, and the band sits
+            # between _raw and what is sent.
+            #
+            # _raw is fenced one band WIDER than the limit. The output trails
+            # _raw by up to a band, so fenced at the limit itself the output
+            # could never quite reach it. The overshoot past that is
+            # dropped here, every cycle - which is what makes reversing off
+            # a fence immediate.
+            band = cfg.tremor_deg
+            rp = _clamp(rp, cfg.psi_limit_deg + band,     "psi",     hit, self._raw[0])
+            rh = _clamp(rh, cfg.phi_limit_deg + band,     "phi",     hit, self._raw[1])
+            rn = _clamp(rn, cfg.theta_n_limit_deg + band, "theta_n", hit, self._raw[2])
+            self._raw[:] = (rp, rh, rn)
 
             held = self.pose_deg
+            psi     = drag_band(rp, held[0], band)
+            phi     = drag_band(rh, held[1], band)
+            theta_n = drag_band(rn, held[2], band)
             psi     = _clamp(psi,     cfg.psi_limit_deg,     "psi",     hit, held[0])
             phi     = _clamp(phi,     cfg.phi_limit_deg,     "phi",     hit, held[1])
             theta_n = _clamp(theta_n, cfg.theta_n_limit_deg, "theta_n", hit, held[2])
@@ -338,4 +503,4 @@ class PoseMap:
 
         return Command(psi, phi, theta_n, tool,
                        self.rot_engaged, self.trans_engaged,
-                       self._s, tuple(hit), locked)
+                       self._s, tuple(dict.fromkeys(hit)), locked)
